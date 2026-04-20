@@ -1,0 +1,6 @@
+numpy>=1.26
+matplotlib>=3.8
+pytest>=7.0
+fastapi>=0.110
+uvicorn[standard]>=0.27
+websockets>=12.0

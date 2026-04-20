@@ -1,0 +1,42 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+.eggs/
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# --- Virtual envs ---
+.venv/
+venv/
+env/
+
+# --- Project-specific run artifacts ---
+runs/
+checkpoints/
+diagnostics/
+*.npz
+*.log
+champions.npz
+
+# --- Node / WebUI ---
+webui/node_modules/
+webui/dist/
+webui/.vite/
+webui/*.local
+webui/*.tsbuildinfo
+
+# --- IDE / OS ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo

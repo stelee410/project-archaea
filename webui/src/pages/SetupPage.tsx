@@ -1,0 +1,274 @@
+import { useState } from "react";
+import clsx from "clsx";
+import { api } from "../api";
+import { useStore } from "../store";
+import type { BudgetMode, SimConfig } from "../types";
+
+interface FieldDoc {
+  key: keyof SimConfig;
+  label: string;
+  desc: string;
+  detail: string;
+  defaultValue: number | string | null;
+  hint?: string;
+}
+
+const FIELDS: FieldDoc[] = [
+  {
+    key: "seed",
+    label: "随机种子 seed",
+    desc: "控制初始权重、Poisson 输入、突变方向的全局 RNG。",
+    detail:
+      "同一 seed + 同一代码 → 行为可复现。换 seed 是验证「成功不是运气」最简单的方法。",
+    defaultValue: 42,
+  },
+  {
+    key: "pop_max",
+    label: "种群硬上限 pop_max",
+    desc: "槽位总数；繁殖装不下时按最低 Credit 替换。",
+    detail:
+      "SPEC 默认 1000；WebUI 实时模式下建议 200–500，dot 太多渲染会卡。",
+    defaultValue: 200,
+  },
+  {
+    key: "n_initial",
+    label: "初始存活 n_initial",
+    desc: "起步时活着的祖先数量；可远小于 pop_max 实现「最小启动」。",
+    detail:
+      "1 = 单祖先扩张（殖民观感强但前 20 s 命悬一线）；50–100 = 平衡。灭绝判据已自适应：人口曾到过 10+ 才会触发「跌破 10」halt。",
+    defaultValue: 100,
+  },
+  {
+    key: "carrying_capacity",
+    label: "承载力 K (off-SPEC)",
+    desc: "共享预算模式下的目标种群规模；留空或 0 = 关闭。",
+    detail:
+      "B = K × R_MAX = K × 5 单位/窗。N* ≈ 4 × K × r_mean。例如 K=30 时群体会自发收敛到 ~100 左右，pop_max 退化为安全阀。",
+    defaultValue: null,
+  },
+  {
+    key: "budget_mode",
+    label: "预算模式 budget_mode",
+    desc: "'none' = SPEC §4.4（每人独立奖励，资源无限）；'shared' 启用承载力。",
+    detail:
+      "'shared' 模拟「资源稀缺」：总需求 D 超过预算 B 时全员等比削减。强者绝对额仍多但所有人都被稀释 → 群体自发停止扩张。",
+    defaultValue: "none",
+  },
+  {
+    key: "target_speed_hz",
+    label: "仿真速度 target_speed_hz",
+    desc: "每实际秒推进多少个 500 ms 仿真窗；0 = 全速。",
+    detail:
+      "20 Hz ≈ 实时跟踪可视化；100+ Hz 用于快速堆 t_sim；全速时 WebUI 仍按数据帧率重绘。",
+    defaultValue: 20,
+  },
+];
+
+export function SetupPage({ onLaunched }: { onLaunched: () => void }) {
+  const status = useStore((s) => s.status);
+  const setStatus = useStore((s) => s.setStatus);
+  const resetHistory = useStore((s) => s.resetHistory);
+
+  const [cfg, setCfg] = useState<SimConfig>({
+    seed: 42,
+    pop_max: 200,
+    n_initial: 100,
+    carrying_capacity: null,
+    budget_mode: "none",
+    target_speed_hz: 20,
+  });
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  function update<K extends keyof SimConfig>(k: K, v: SimConfig[K]) {
+    setCfg((c) => {
+      const next = { ...c, [k]: v } as SimConfig;
+      // 切到 shared 模式时，自动给一个合理默认承载力（pop_max/5），方便点开即用。
+      if (
+        k === "budget_mode" &&
+        v === "shared" &&
+        (next.carrying_capacity == null || next.carrying_capacity <= 0)
+      ) {
+        next.carrying_capacity = Math.max(1, Math.round(next.pop_max / 5));
+      }
+      return next;
+    });
+  }
+
+  const validationError =
+    cfg.budget_mode === "shared" && (!cfg.carrying_capacity || cfg.carrying_capacity <= 0)
+      ? "budget_mode=shared 必须填写 carrying_capacity (>0)，否则后端会拒绝启动。"
+      : null;
+
+  async function launch() {
+    if (validationError) {
+      setError(validationError);
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      resetHistory();
+      const next = await api.start(cfg);
+      setStatus(next);
+      onLaunched();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function stop() {
+    setBusy(true);
+    try {
+      const next = await api.stop();
+      setStatus(next);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="max-w-[1100px] mx-auto p-6">
+      <h1 className="text-xl font-semibold mb-1">设置并启动仿真</h1>
+      <p className="text-sm text-slate-400 mb-6">
+        修改任何参数后点击 <span className="text-emerald-300">启动 / 重启</span>。
+        当前如果已有仿真在跑，会被新参数替换；客户端历史曲线随之清零。
+      </p>
+
+      {(error || validationError) && (
+        <div className="mb-4 px-4 py-2 rounded bg-rose-500/15 text-rose-200 text-sm border border-rose-500/30">
+          {error ?? validationError}
+        </div>
+      )}
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        {FIELDS.map((f) => (
+          <FieldRow
+            key={f.key as string}
+            field={f}
+            value={cfg[f.key]}
+            onChange={(v) => update(f.key, v as never)}
+          />
+        ))}
+      </div>
+
+      <div className="mt-8 flex items-center gap-3">
+        <button
+          disabled={busy || !!validationError}
+          onClick={launch}
+          className={clsx(
+            "px-5 py-2 rounded-md font-medium",
+            "bg-emerald-500 hover:bg-emerald-400 text-slate-950 transition-colors",
+            "disabled:opacity-40 disabled:cursor-not-allowed"
+          )}
+          title={validationError ?? undefined}
+        >
+          {status?.running ? "重启（用新参数）" : "启动"}
+        </button>
+        <button
+          disabled={busy || !status?.running}
+          onClick={stop}
+          className={clsx(
+            "px-5 py-2 rounded-md font-medium",
+            "bg-slate-800 hover:bg-slate-700 text-slate-100",
+            "disabled:opacity-40 disabled:cursor-not-allowed"
+          )}
+        >
+          停止
+        </button>
+        {status?.running && (
+          <span className="text-sm text-slate-400 numeric">
+            正在跑：seed={status.config?.seed} · pop_max={status.config?.pop_max}{" "}
+            · t_sim={status.t_sim.toFixed(1)}s · N={status.n_living}
+          </span>
+        )}
+      </div>
+
+      <div className="mt-10 rounded-lg border border-slate-800 bg-slate-900/50 p-5 text-sm leading-relaxed text-slate-300">
+        <h2 className="text-base font-semibold text-slate-100 mb-2">
+          一些设计澄清
+        </h2>
+        <ul className="list-disc list-inside space-y-1.5">
+          <li>
+            <b>个体之间是否联通？</b>{" "}
+            <span className="text-amber-300">没有</span>。SPEC §1
+            规定每个 agent 是独立的 10→20→1 SNN，互相只通过共享资源/槽位竞争耦合。
+            观测页点击某个 dot 会展开「该 agent 自己」的拓扑图（这才是真实存在的连接）。
+          </li>
+          <li>
+            <b>使用页 Credit 反馈</b>会真正改变种群里被选中 agent 的 Credit。
+            Credit ≤ 0 立即饿死；活下来的会进入下一窗 → 真正影响演化。
+          </li>
+          <li>
+            <b>off-SPEC 标记</b>：承载力 / 共享预算 是 SPEC 之外的扩展，
+            <code className="px-1 py-0.5 rounded bg-slate-800 mx-1">budget_mode=none</code>
+            时行为与 SPEC 完全一致。
+          </li>
+        </ul>
+      </div>
+    </div>
+  );
+}
+
+function FieldRow({
+  field,
+  value,
+  onChange,
+}: {
+  field: FieldDoc;
+  value: SimConfig[keyof SimConfig];
+  onChange: (v: SimConfig[keyof SimConfig]) => void;
+}) {
+  return (
+    <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-4">
+      <div className="flex items-baseline justify-between gap-2">
+        <label className="text-sm font-semibold text-slate-100">
+          {field.label}
+        </label>
+        <span className="text-[11px] text-slate-500 font-mono">{field.key}</span>
+      </div>
+      <p className="text-xs text-slate-400 mt-1">{field.desc}</p>
+      <div className="mt-2">
+        {field.key === "budget_mode" ? (
+          <select
+            value={value as string}
+            onChange={(e) => onChange(e.target.value as BudgetMode)}
+            className="w-full bg-slate-950 border border-slate-700 rounded px-2 py-1.5 text-sm font-mono"
+          >
+            <option value="none">none — SPEC §4.4 (默认)</option>
+            <option value="shared">shared — 共享预算 (off-SPEC)</option>
+          </select>
+        ) : field.key === "carrying_capacity" ? (
+          <input
+            type="number"
+            min={0}
+            placeholder="留空 / 0 = 关闭"
+            value={(value as number | null) ?? ""}
+            onChange={(e) => {
+              const v = e.target.value.trim();
+              onChange((v === "" ? null : Number(v)) as never);
+            }}
+            className="w-full bg-slate-950 border border-slate-700 rounded px-2 py-1.5 text-sm font-mono numeric"
+          />
+        ) : (
+          <input
+            type="number"
+            value={(value as number | null) ?? ""}
+            onChange={(e) => onChange(Number(e.target.value) as never)}
+            className="w-full bg-slate-950 border border-slate-700 rounded px-2 py-1.5 text-sm font-mono numeric"
+          />
+        )}
+      </div>
+      <details className="mt-2 text-xs text-slate-400">
+        <summary className="cursor-pointer text-slate-500 hover:text-slate-300">
+          详细解释
+        </summary>
+        <p className="mt-1 leading-relaxed">{field.detail}</p>
+      </details>
+    </div>
+  );
+}
