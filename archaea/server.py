@@ -42,14 +42,56 @@ class SimConfigBody(BaseModel):
     carrying_capacity: int | None = Field(None, ge=1)
     budget_mode: Literal["none", "shared"] = "none"
     target_speed_hz: float = Field(20.0, ge=0.0, le=2000.0)
+    # Slime-mold extension (defaults preserve SPEC v1.0 behaviour)
+    slime_mold: bool = False
+    grid_size: int = Field(16, ge=4, le=128)
+    pheromone_decay: float = Field(0.05, ge=0.0, le=1.0)
+    pheromone_diffusion: float = Field(0.20, ge=0.0, le=1.0)
+    pheromone_emit: float = Field(0.5, ge=0.0)
+    pheromone_bonus_k: float = Field(0.5, ge=0.0, le=10.0)
+    hgt_enabled: bool = True
+    hgt_prob: float = Field(0.02, ge=0.0, le=1.0)
+    hgt_blend: float = Field(0.30, ge=0.0, le=1.0)
+    migrate_enabled: bool = True
+    migrate_prob: float = Field(0.30, ge=0.0, le=1.0)
+    # SPEC v1.2 (off-SPEC) fitness magnitude calibration penalty
+    calibration_lambda: float = Field(0.0, ge=0.0, le=5.0)
+    # SPEC v1.2 (off-SPEC) output-layer synaptic gain g
+    synapse_gain: float = Field(1.0, gt=0.0, le=20.0)
 
 
 class InferenceBody(BaseModel):
     f_in_hz: float = Field(50.0, ge=0.0, le=1000.0)
-    target: Literal["best", "ensemble", "random"] = "best"
+    target: Literal["best", "ensemble", "random", "swarm"] = "best"
     top_k: int = Field(5, ge=1, le=50)
     duration_ms: float = Field(500.0, ge=10.0, le=5000.0)
     warmup_ms: float = Field(100.0, ge=0.0, le=2000.0)
+    swarm_radius: int = Field(1, ge=1, le=8)
+
+
+class SweepBody(BaseModel):
+    f_in_min: float = Field(0.0, ge=0.0, le=1000.0)
+    f_in_max: float = Field(200.0, ge=0.0, le=1000.0)
+    n_points: int = Field(15, ge=2, le=64)
+    target: Literal["best", "ensemble", "random", "swarm"] = "best"
+    top_k: int = Field(5, ge=1, le=50)
+    duration_ms: float = Field(500.0, ge=10.0, le=5000.0)
+    warmup_ms: float = Field(100.0, ge=0.0, le=2000.0)
+    swarm_radius: int = Field(1, ge=1, le=8)
+    repeats: int = Field(1, ge=1, le=10)
+    # Optional explicit input pattern. When provided, n_points/min/max are ignored.
+    # 1..256 points, each clamped to [0, 1000] Hz server-side.
+    f_in_seq: list[float] | None = Field(None, max_length=256)
+    # Plan A: inference-time affine calibration (post-process; does not touch evolution).
+    calibrate: bool = False
+
+
+class CalibrationLambdaBody(BaseModel):
+    calibration_lambda: float = Field(..., ge=0.0, le=5.0)
+
+
+class SynapseGainBody(BaseModel):
+    synapse_gain: float = Field(..., gt=0.0, le=20.0)
 
 
 class FeedbackBody(BaseModel):
@@ -98,6 +140,19 @@ async def api_start(body: SimConfigBody) -> dict[str, Any]:
         carrying_capacity=body.carrying_capacity,
         budget_mode=body.budget_mode,
         target_speed_hz=body.target_speed_hz,
+        slime_mold=body.slime_mold,
+        grid_size=body.grid_size,
+        pheromone_decay=body.pheromone_decay,
+        pheromone_diffusion=body.pheromone_diffusion,
+        pheromone_emit=body.pheromone_emit,
+        pheromone_bonus_k=body.pheromone_bonus_k,
+        hgt_enabled=body.hgt_enabled,
+        hgt_prob=body.hgt_prob,
+        hgt_blend=body.hgt_blend,
+        migrate_enabled=body.migrate_enabled,
+        migrate_prob=body.migrate_prob,
+        calibration_lambda=body.calibration_lambda,
+        synapse_gain=body.synapse_gain,
     )
     try:
         return get_runtime().start(cfg)
@@ -123,10 +178,59 @@ async def api_inference(body: InferenceBody) -> dict[str, Any]:
             body.top_k,
             body.duration_ms,
             body.warmup_ms,
+            body.swarm_radius,
         )
     except RuntimeError as e:
         raise HTTPException(status_code=409, detail=str(e))
     except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/sweep")
+async def api_sweep(body: SweepBody) -> dict[str, Any]:
+    rt = get_runtime()
+    if not rt.is_running():
+        raise HTTPException(status_code=409, detail="simulation not running")
+    try:
+        return await asyncio.to_thread(
+            rt.sweep,
+            body.f_in_min,
+            body.f_in_max,
+            body.n_points,
+            body.target,
+            body.top_k,
+            body.duration_ms,
+            body.warmup_ms,
+            body.swarm_radius,
+            body.repeats,
+            body.f_in_seq,
+            body.calibrate,
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/calibration-lambda")
+async def api_set_calibration_lambda(body: CalibrationLambdaBody) -> dict[str, Any]:
+    rt = get_runtime()
+    if not rt.is_running():
+        raise HTTPException(status_code=409, detail="simulation not running")
+    try:
+        return rt.set_calibration_lambda(body.calibration_lambda)
+    except (RuntimeError, ValueError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/synapse-gain")
+async def api_set_synapse_gain(body: SynapseGainBody) -> dict[str, Any]:
+    rt = get_runtime()
+    if not rt.is_running():
+        raise HTTPException(status_code=409, detail="simulation not running")
+    try:
+        return rt.set_synapse_gain(body.synapse_gain)
+    except (RuntimeError, ValueError) as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 

@@ -24,6 +24,7 @@ function dotColor(alive: boolean, credit: number): string {
 
 export function DotGrid({ ev, popMax, selectedSlot, onSelect }: Props) {
   const ref = useRef<HTMLCanvasElement | null>(null);
+  const slimeMode = !!(ev?.slime_enabled && ev?.grid_size > 0);
   const cols = useMemo(() => Math.ceil(Math.sqrt(popMax)), [popMax]);
   const rows = useMemo(() => Math.ceil(popMax / cols), [popMax, cols]);
 
@@ -42,50 +43,20 @@ export function DotGrid({ ev, popMax, selectedSlot, onSelect }: Props) {
     ctx.fillStyle = "#0f172a";
     ctx.fillRect(0, 0, W, H);
 
-    const pad = 8;
-    const dxAvail = (W - pad * 2) / cols;
-    const dyAvail = (H - pad * 2) / rows;
-    const r = Math.max(2.5, Math.min(dxAvail, dyAvail) * 0.42);
-
-    for (let s = 0; s < popMax; s++) {
-      const cx = pad + (s % cols + 0.5) * dxAvail;
-      const cy = pad + (Math.floor(s / cols) + 0.5) * dyAvail;
-      const alive = ev ? !!ev.alive[s] : false;
-      const credit = ev ? ev.credit[s] : 0;
-      ctx.beginPath();
-      ctx.arc(cx, cy, r, 0, Math.PI * 2);
-      ctx.fillStyle = dotColor(alive, credit);
-      ctx.fill();
-      let stroke: string | null = null;
-      let lw = 0.8;
-      if (eventChildren.has(s)) {
-        stroke = "#ec4899";
-        lw = 2;
-        ctx.strokeStyle = stroke;
-        ctx.lineWidth = lw;
-        ctx.stroke();
-      } else if (eventParents.has(s)) {
-        stroke = "#f9a8d4";
-        lw = 2;
-        ctx.strokeStyle = stroke;
-        ctx.lineWidth = lw;
-        ctx.stroke();
-      } else if (eventDeads.has(s)) {
-        stroke = "#94a3b8";
-        lw = 1.4;
-        ctx.strokeStyle = stroke;
-        ctx.lineWidth = lw;
-        ctx.stroke();
-      }
-      if (selectedSlot === s) {
-        ctx.beginPath();
-        ctx.arc(cx, cy, r + 3, 0, Math.PI * 2);
-        ctx.strokeStyle = "#22d3ee";
-        ctx.lineWidth = 2;
-        ctx.stroke();
-      }
+    if (slimeMode && ev) {
+      drawSpatial(ctx, W, H, ev, selectedSlot, {
+        children: eventChildren,
+        parents: eventParents,
+        deads: eventDeads,
+      });
+    } else {
+      drawSlotGrid(ctx, W, H, ev, popMax, cols, rows, selectedSlot, {
+        children: eventChildren,
+        parents: eventParents,
+        deads: eventDeads,
+      });
     }
-  }, [ev, popMax, cols, rows, selectedSlot, eventChildren, eventParents, eventDeads]);
+  }, [ev, popMax, cols, rows, selectedSlot, eventChildren, eventParents, eventDeads, slimeMode]);
 
   function handleClick(e: React.MouseEvent<HTMLCanvasElement>) {
     const cv = ref.current;
@@ -93,6 +64,29 @@ export function DotGrid({ ev, popMax, selectedSlot, onSelect }: Props) {
     const rect = cv.getBoundingClientRect();
     const x = ((e.clientX - rect.left) / rect.width) * cv.width;
     const y = ((e.clientY - rect.top) / rect.height) * cv.height;
+
+    if (slimeMode && ev) {
+      const G = ev.grid_size;
+      const pad = 8;
+      const cellW = (cv.width - pad * 2) / G;
+      const cellH = (cv.height - pad * 2) / G;
+      let bestSlot = -1;
+      let bestD = Infinity;
+      for (let s = 0; s < ev.alive.length; s++) {
+        if (!ev.alive[s]) continue;
+        const [px, py] = ev.positions[s] ?? [0, 0];
+        const cx = pad + (px + 0.5) * cellW;
+        const cy = pad + (py + 0.5) * cellH;
+        const d = (cx - x) ** 2 + (cy - y) ** 2;
+        if (d < bestD) {
+          bestD = d;
+          bestSlot = s;
+        }
+      }
+      if (bestSlot >= 0 && bestD < (Math.min(cellW, cellH) * 1.5) ** 2) onSelect(bestSlot);
+      return;
+    }
+
     const pad = 8;
     const dxAvail = (cv.width - pad * 2) / cols;
     const dyAvail = (cv.height - pad * 2) / rows;
@@ -112,19 +106,198 @@ export function DotGrid({ ev, popMax, selectedSlot, onSelect }: Props) {
         onClick={handleClick}
         className="w-full h-full rounded border border-slate-800 cursor-pointer"
       />
-      <div className="mt-2 flex flex-wrap gap-3 text-[11px] text-slate-400">
-        <Legend dot="#374151" label="空槽" />
-        <Legend dot="rgb(33, 245, 96)" label="高 Credit" />
-        <Legend dot="#eab308" label="中 Credit" />
-        <Legend dot="#f97316" label="低 Credit" />
-        <Legend dot="#dc2626" label="临界" />
-        <Legend dot="#ec4899" label="新生 (粉描边)" />
-        <Legend dot="#f9a8d4" label="亲代 (浅粉描边)" />
-        <Legend dot="#94a3b8" label="饿死 (灰描边)" />
-        <span className="ml-auto text-slate-500">点击 dot → 右侧查看 agent 内部 10→20→1 拓扑</span>
-      </div>
+      {slimeMode ? (
+        <div className="mt-2 flex flex-wrap gap-3 text-[11px] text-slate-400">
+          <span className="inline-flex items-center gap-1.5">
+            <span className="inline-block w-3 h-3 rounded-sm" style={{ background: "linear-gradient(90deg,#0f172a,#a855f7,#fbbf24)" }} />
+            信息素 (低 → 高)
+          </span>
+          <Legend dot="rgb(33, 245, 96)" label="高 Credit" />
+          <Legend dot="#eab308" label="中" />
+          <Legend dot="#f97316" label="低" />
+          <Legend dot="#dc2626" label="临界" />
+          <Legend dot="#ec4899" label="新生" />
+          <Legend dot="#f9a8d4" label="亲代" />
+          <Legend dot="#94a3b8" label="死亡" />
+          <span className="ml-auto text-slate-500">
+            🍄 黏菌模式 · {ev?.grid_size}×{ev?.grid_size} · P_max={(ev?.pheromone_max ?? 0).toFixed(2)} · HGT={ev?.hgt_count ?? 0} · 移动={ev?.migrations ?? 0}
+          </span>
+        </div>
+      ) : (
+        <div className="mt-2 flex flex-wrap gap-3 text-[11px] text-slate-400">
+          <Legend dot="#374151" label="空槽" />
+          <Legend dot="rgb(33, 245, 96)" label="高 Credit" />
+          <Legend dot="#eab308" label="中 Credit" />
+          <Legend dot="#f97316" label="低 Credit" />
+          <Legend dot="#dc2626" label="临界" />
+          <Legend dot="#ec4899" label="新生 (粉描边)" />
+          <Legend dot="#f9a8d4" label="亲代 (浅粉描边)" />
+          <Legend dot="#94a3b8" label="饿死 (灰描边)" />
+          <span className="ml-auto text-slate-500">点击 dot → 右侧查看 agent 内部 10→20→1 拓扑</span>
+        </div>
+      )}
     </div>
   );
+}
+
+interface OverlaySets {
+  children: Set<number>;
+  parents: Set<number>;
+  deads: Set<number>;
+}
+
+function drawSlotGrid(
+  ctx: CanvasRenderingContext2D,
+  W: number,
+  H: number,
+  ev: TelemetryEvent | null,
+  popMax: number,
+  cols: number,
+  rows: number,
+  selectedSlot: number | null,
+  sets: OverlaySets
+) {
+  const pad = 8;
+  const dxAvail = (W - pad * 2) / cols;
+  const dyAvail = (H - pad * 2) / rows;
+  const r = Math.max(2.5, Math.min(dxAvail, dyAvail) * 0.42);
+
+  for (let s = 0; s < popMax; s++) {
+    const cx = pad + (s % cols + 0.5) * dxAvail;
+    const cy = pad + (Math.floor(s / cols) + 0.5) * dyAvail;
+    const alive = ev ? !!ev.alive[s] : false;
+    const credit = ev ? ev.credit[s] : 0;
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, 0, Math.PI * 2);
+    ctx.fillStyle = dotColor(alive, credit);
+    ctx.fill();
+    drawOverlay(ctx, cx, cy, r, s, sets);
+    if (selectedSlot === s) {
+      ctx.beginPath();
+      ctx.arc(cx, cy, r + 3, 0, Math.PI * 2);
+      ctx.strokeStyle = "#22d3ee";
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
+  }
+}
+
+function drawSpatial(
+  ctx: CanvasRenderingContext2D,
+  W: number,
+  H: number,
+  ev: TelemetryEvent,
+  selectedSlot: number | null,
+  sets: OverlaySets
+) {
+  const G = ev.grid_size;
+  const pad = 8;
+  const cellW = (W - pad * 2) / G;
+  const cellH = (H - pad * 2) / G;
+
+  const pmax = Math.max(ev.pheromone_max, 1e-9);
+  for (let i = 0; i < G; i++) {
+    for (let j = 0; j < G; j++) {
+      const v = (ev.pheromone[i]?.[j] ?? 0) / pmax;
+      ctx.fillStyle = pheromoneColor(v);
+      ctx.fillRect(pad + i * cellW, pad + j * cellH, cellW + 0.5, cellH + 0.5);
+    }
+  }
+
+  ctx.strokeStyle = "rgba(255,255,255,0.04)";
+  ctx.lineWidth = 1;
+  for (let i = 0; i <= G; i++) {
+    ctx.beginPath();
+    ctx.moveTo(pad + i * cellW, pad);
+    ctx.lineTo(pad + i * cellW, pad + G * cellH);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(pad, pad + i * cellH);
+    ctx.lineTo(pad + G * cellW, pad + i * cellH);
+    ctx.stroke();
+  }
+
+  // Count agents per cell to jitter overlapping dots.
+  const cellCounts = new Map<number, number>();
+  const cellSeen = new Map<number, number>();
+  for (let s = 0; s < ev.alive.length; s++) {
+    if (!ev.alive[s]) continue;
+    const [px, py] = ev.positions[s] ?? [0, 0];
+    const key = px * G + py;
+    cellCounts.set(key, (cellCounts.get(key) ?? 0) + 1);
+  }
+
+  const r = Math.max(2.5, Math.min(cellW, cellH) * 0.28);
+  for (let s = 0; s < ev.alive.length; s++) {
+    if (!ev.alive[s]) continue;
+    const [px, py] = ev.positions[s] ?? [0, 0];
+    const key = px * G + py;
+    const total = cellCounts.get(key) ?? 1;
+    const idx = cellSeen.get(key) ?? 0;
+    cellSeen.set(key, idx + 1);
+    let cx = pad + (px + 0.5) * cellW;
+    let cy = pad + (py + 0.5) * cellH;
+    if (total > 1) {
+      const angle = (idx / total) * Math.PI * 2;
+      const radius = Math.min(cellW, cellH) * 0.22;
+      cx += Math.cos(angle) * radius;
+      cy += Math.sin(angle) * radius;
+    }
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, 0, Math.PI * 2);
+    ctx.fillStyle = dotColor(true, ev.credit[s]);
+    ctx.fill();
+    drawOverlay(ctx, cx, cy, r, s, sets);
+    if (selectedSlot === s) {
+      ctx.beginPath();
+      ctx.arc(cx, cy, r + 3, 0, Math.PI * 2);
+      ctx.strokeStyle = "#22d3ee";
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
+  }
+}
+
+function drawOverlay(
+  ctx: CanvasRenderingContext2D,
+  cx: number,
+  cy: number,
+  r: number,
+  s: number,
+  sets: OverlaySets
+) {
+  if (sets.children.has(s)) {
+    ctx.strokeStyle = "#ec4899";
+    ctx.lineWidth = 2;
+    ctx.stroke();
+  } else if (sets.parents.has(s)) {
+    ctx.strokeStyle = "#f9a8d4";
+    ctx.lineWidth = 2;
+    ctx.stroke();
+  } else if (sets.deads.has(s)) {
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, 0, Math.PI * 2);
+    ctx.strokeStyle = "#94a3b8";
+    ctx.lineWidth = 1.4;
+    ctx.stroke();
+  }
+}
+
+function pheromoneColor(t: number): string {
+  // Dark slate → fuchsia → amber, perceptually scaled.
+  const v = Math.max(0, Math.min(1, t));
+  if (v < 0.5) {
+    const a = v / 0.5;
+    const r = Math.round(15 + (168 - 15) * a);
+    const g = Math.round(23 + (85 - 23) * a);
+    const b = Math.round(42 + (247 - 42) * a);
+    return `rgb(${r},${g},${b})`;
+  }
+  const a = (v - 0.5) / 0.5;
+  const r = Math.round(168 + (251 - 168) * a);
+  const g = Math.round(85 + (191 - 85) * a);
+  const b = Math.round(247 + (36 - 247) * a);
+  return `rgb(${r},${g},${b})`;
 }
 
 function Legend({ dot, label }: { dot: string; label: string }) {

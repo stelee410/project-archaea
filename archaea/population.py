@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from .agent import N_HISTORY, pearson_r
+from .agent import N_HISTORY, fitness_with_calibration_penalty, pearson_r
 from .economy import (
     BREATH_PER_WINDOW,
     BUDGET_MODE_NONE,
@@ -24,6 +24,19 @@ from .neuron import (
     N_WEIGHTS,
     V_REST,
     NetworkBatch,
+)
+from .slime import (
+    SlimeConfig,
+    blend_weights,
+    chemotaxis_step,
+    decay_and_diffuse,
+    emit,
+    hgt_pairs,
+    new_field,
+    position_near,
+    random_positions,
+    reward_bonus,
+    sense,
 )
 from .stimulus import draw_input_rate, poisson_spikes_window
 
@@ -69,6 +82,15 @@ class Population:
         "ref_o",
         "carrying_capacity",
         "budget_mode",
+        "slime",
+        "positions",
+        "pheromone",
+        "_last_local_p",
+        "_last_field_max",
+        "_last_hgt_count",
+        "_last_migrations",
+        "calibration_lambda",
+        "synapse_gain",
     )
 
     def __init__(
@@ -78,6 +100,9 @@ class Population:
         n_initial: int | None = None,
         carrying_capacity: int | None = None,
         budget_mode: str = BUDGET_MODE_NONE,
+        slime: SlimeConfig | None = None,
+        calibration_lambda: float = 0.0,
+        synapse_gain: float = 1.0,
     ):
         self.pop_max = int(pop_max)
         self.rng = rng
@@ -90,6 +115,14 @@ class Population:
         self.carrying_capacity = int(carrying_capacity) if carrying_capacity else 0
         if self.budget_mode == BUDGET_MODE_SHARED and self.carrying_capacity <= 0:
             raise ValueError("budget_mode='shared' requires carrying_capacity > 0")
+        self.slime = slime if slime is not None else SlimeConfig()
+        self.slime.validate()
+        if calibration_lambda < 0.0:
+            raise ValueError("calibration_lambda must be ≥ 0.0")
+        self.calibration_lambda = float(calibration_lambda)
+        if synapse_gain <= 0.0:
+            raise ValueError("synapse_gain must be > 0.0")
+        self.synapse_gain = float(synapse_gain)
         self.alive = np.zeros(self.pop_max, dtype=bool)
         self.weights = np.zeros((self.pop_max, N_WEIGHTS), dtype=np.float64)
         self.credit = np.zeros(self.pop_max, dtype=np.float64)
@@ -100,6 +133,18 @@ class Population:
         self.ref_h = np.zeros((self.pop_max, N_HIDDEN), dtype=np.int32)
         self.v_o = np.full((self.pop_max, N_OUTPUT), V_REST, dtype=np.float64)
         self.ref_o = np.zeros((self.pop_max, N_OUTPUT), dtype=np.int32)
+
+        # Slime spatial state (only used when self.slime.enabled).
+        self.positions = np.zeros((self.pop_max, 2), dtype=np.int32)
+        self.pheromone = new_field(self.slime.grid_size)
+        self._last_local_p = np.zeros(0, dtype=np.float64)
+        self._last_field_max = 0.0
+        self._last_hgt_count = 0
+        self._last_migrations = 0
+
+        if self.slime.enabled:
+            init_xy = random_positions(self.rng, self.pop_max, self.slime.grid_size)
+            self.positions[...] = init_xy
 
         for i in range(n0):
             self.spawn_initial_slot(i)
@@ -137,6 +182,10 @@ class Population:
         idx = (np.arange(N_HISTORY, dtype=np.int64) + base) % N_HISTORY
         fi = self._fin[slot, idx]
         fo = self._fout[slot, idx]
+        if self.calibration_lambda > 0.0:
+            return fitness_with_calibration_penalty(
+                fi, fo, self.calibration_lambda
+            )
         return pearson_r(fi, fo)
 
     def _fitness_defined(self, slot: int) -> bool:
@@ -165,7 +214,7 @@ class Population:
         if idx.size == 0:
             return np.zeros(0, dtype=np.int64)
         W = self.weights[idx]
-        net = NetworkBatch(W)
+        net = NetworkBatch(W, output_gain=self.synapse_gain)
         net.hidden.v[...] = self.v_h[idx]
         net.hidden.refrac[...] = self.ref_h[idx]
         net.out.v[...] = self.v_o[idx]
@@ -201,7 +250,9 @@ class Population:
         order = np.lexsort((cand.astype(np.int64), fit, cred))
         return int(cand[order[0]])
 
-    def _write_child_into_slot(self, slot: int, w_child: np.ndarray) -> None:
+    def _write_child_into_slot(
+        self, slot: int, w_child: np.ndarray, parent_slot: int | None = None
+    ) -> None:
         self.alive[slot] = True
         self.weights[slot] = w_child
         self.credit[slot] = C_INIT
@@ -209,6 +260,13 @@ class Population:
         self._fin[slot].fill(0.0)
         self._fout[slot].fill(0.0)
         self._reset_membrane_slot(slot)
+        if self.slime.enabled:
+            if parent_slot is not None:
+                self.positions[slot] = position_near(
+                    self.rng, self.positions[parent_slot], self.slime.grid_size, max_offset=1
+                )
+            else:
+                self.positions[slot] = random_positions(self.rng, 1, self.slime.grid_size)[0]
 
     def step_window(self) -> dict:
         """
@@ -246,6 +304,17 @@ class Population:
             rewards = plain_rewards(defined_mask, r_vals_arr)
             budget_pressure = 0.0  # sentinel: budget mode disabled
 
+        # ── Slime: pheromone-modulated reward (cooperation incentive) ──
+        local_p = np.zeros(n_alive, dtype=np.float64)
+        field_max = 0.0
+        if self.slime.enabled and n_alive > 0:
+            local_p = sense(self.pheromone, self.positions[idx])
+            field_max = float(self.pheromone.max())
+            bonus = reward_bonus(local_p, field_max, self.slime.pheromone_bonus_k)
+            rewards = rewards * bonus
+        self._last_local_p = local_p
+        self._last_field_max = field_max
+
         if n_alive > 0:
             self.credit[idx] = self.credit[idx] + rewards - BREATH_PER_WINDOW
 
@@ -256,6 +325,44 @@ class Population:
         else:
             r_max = 0.0
             r_mean = 0.0
+
+        # ── Slime: horizontal gene transfer (social, lateral learning) ──
+        hgt_count = 0
+        if (
+            self.slime.enabled
+            and self.slime.hgt_enabled
+            and n_alive >= 2
+            and self.slime.hgt_prob > 0.0
+        ):
+            pos_alive = self.positions[idx]
+            cred_alive = self.credit[idx].copy()
+            pairs = hgt_pairs(
+                self.rng,
+                pos_alive,
+                cred_alive,
+                self.slime.grid_size,
+                self.slime.hgt_radius,
+                self.slime.hgt_prob,
+                self.slime.hgt_donor_ratio,
+            )
+            for r_local, d_local in pairs:
+                r_slot = int(idx[r_local])
+                d_slot = int(idx[d_local])
+                if not self.alive[r_slot] or not self.alive[d_slot]:
+                    continue
+                if self.credit[r_slot] <= self.slime.hgt_cost:
+                    continue
+                self.weights[r_slot] = blend_weights(
+                    self.weights[r_slot], self.weights[d_slot], self.slime.hgt_blend
+                )
+                self.credit[r_slot] -= self.slime.hgt_cost
+                # Recipient was modified — flush its history; old (f_in, f_out) no longer
+                # reflects current weights. Resets fitness to "undefined" until 40 new windows.
+                self._hc[r_slot] = 0
+                self._fin[r_slot].fill(0.0)
+                self._fout[r_slot].fill(0.0)
+                hgt_count += 1
+        self._last_hgt_count = hgt_count
 
         dead_slots: list[int] = []
         for slot in idx.tolist():
@@ -284,15 +391,46 @@ class Population:
             free = self._find_free_slot()
             if free is not None:
                 child_slot = int(free)
-                self._write_child_into_slot(child_slot, w_child)
+                self._write_child_into_slot(child_slot, w_child, parent_slot=parent)
             else:
                 victim = self._pick_replacement_victim(parent)
                 child_slot = int(victim)
-                self._write_child_into_slot(child_slot, w_child)
+                self._write_child_into_slot(child_slot, w_child, parent_slot=parent)
                 deaths += 1
             births += 1
             repro_parent_slots.append(int(parent))
             repro_child_slots.append(child_slot)
+
+        # ── Slime: pheromone field tick + chemotaxis ──
+        migrations = 0
+        if self.slime.enabled:
+            idx_now = np.sort(self.living_indices())
+            if idx_now.size > 0:
+                fit_now = np.zeros(idx_now.size, dtype=np.float64)
+                for j, slot in enumerate(idx_now.tolist()):
+                    if self._fitness_defined(slot):
+                        fit_now[j] = self._fitness_slot(slot)
+                emit(
+                    self.pheromone,
+                    self.positions[idx_now],
+                    fit_now,
+                    self.slime.pheromone_emit,
+                )
+            self.pheromone = decay_and_diffuse(
+                self.pheromone, self.slime.pheromone_decay, self.slime.pheromone_diffusion
+            )
+            if self.slime.migrate_enabled and idx_now.size > 0:
+                old_pos = self.positions[idx_now].copy()
+                new_pos = chemotaxis_step(
+                    self.rng,
+                    self.pheromone,
+                    self.positions[idx_now],
+                    self.slime.grid_size,
+                    self.slime.migrate_prob,
+                )
+                self.positions[idx_now] = new_pos
+                migrations = int(np.any(new_pos != old_pos, axis=1).sum())
+        self._last_migrations = migrations
 
         return {
             "f_in": f_in,
@@ -305,6 +443,10 @@ class Population:
             "dead_slots": np.asarray(dead_slots, dtype=np.int32),
             "repro_parent_slots": np.asarray(repro_parent_slots, dtype=np.int32),
             "repro_child_slots": np.asarray(repro_child_slots, dtype=np.int32),
+            "pheromone_max": float(self._last_field_max),
+            "pheromone_mean": float(self.pheromone.mean()) if self.slime.enabled else 0.0,
+            "hgt_count": int(self._last_hgt_count),
+            "migrations": int(migrations),
         }
 
     def weight_diversity_metric(self) -> float:

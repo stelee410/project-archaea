@@ -2,6 +2,7 @@ import { useState } from "react";
 import clsx from "clsx";
 import { api } from "../api";
 import { useStore } from "../store";
+import { usePersistentState } from "../hooks/usePersistentState";
 import type { BudgetMode, SimConfig } from "../types";
 
 interface FieldDoc {
@@ -62,6 +63,22 @@ const FIELDS: FieldDoc[] = [
       "20 Hz ≈ 实时跟踪可视化；100+ Hz 用于快速堆 t_sim；全速时 WebUI 仍按数据帧率重绘。",
     defaultValue: 20,
   },
+  {
+    key: "calibration_lambda",
+    label: "幅度校准惩罚 λ (off-SPEC)",
+    desc: "0 = 纯 Pearson r（SPEC §4.1，输出常被压扁）；>0 惩罚 mean(f_out)≠mean(f_in)。",
+    detail:
+      "fitness = r − λ·|mean(f_out)−mean(f_in)|/std(f_in)。Pearson r 对仿射变换不敏感，所以原 SPEC 下 f_out=0.5·f_in 也能拿满分（r=1）。λ=0.3–0.5 会逼种群把斜率推向 1。可在「观测」页右上角实时调，无需重启。",
+    defaultValue: 0,
+  },
+  {
+    key: "synapse_gain",
+    label: "输出层突触增益 g (off-SPEC)",
+    desc: "1.0 = SPEC 默认；>1 物理放大 I_o，让输出神经元真的发更多 spike，raw f_out 直接抬高。",
+    detail:
+      "I_o[t] = I_in · g · Σ_j W_ho[j] · h_spike[t,j]。SPEC §1.1 的 N_OUTPUT=1 + T_REFRACTORY=2ms 决定单神经元最大 ~150 Hz；当输入 f_in 已经接近这个上限、或种群学得很「省电」时，需要 g=2~4 把幅度物理拉上去。和 λ 互补：g 抬硬上限，λ 让种群朝它走。可在「观测」页右上角实时调，无需重启。",
+    defaultValue: 1,
+  },
 ];
 
 export function SetupPage({ onLaunched }: { onLaunched: () => void }) {
@@ -69,13 +86,26 @@ export function SetupPage({ onLaunched }: { onLaunched: () => void }) {
   const setStatus = useStore((s) => s.setStatus);
   const resetHistory = useStore((s) => s.resetHistory);
 
-  const [cfg, setCfg] = useState<SimConfig>({
+  const [cfg, setCfg] = usePersistentState<SimConfig>("sim-config", {
     seed: 42,
     pop_max: 200,
     n_initial: 100,
     carrying_capacity: null,
     budget_mode: "none",
     target_speed_hz: 20,
+    slime_mold: false,
+    grid_size: 16,
+    pheromone_decay: 0.05,
+    pheromone_diffusion: 0.2,
+    pheromone_emit: 0.5,
+    pheromone_bonus_k: 0.5,
+    hgt_enabled: true,
+    hgt_prob: 0.02,
+    hgt_blend: 0.3,
+    migrate_enabled: true,
+    migrate_prob: 0.3,
+    calibration_lambda: 0.0,
+    synapse_gain: 1.0,
   });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -180,6 +210,16 @@ export function SetupPage({ onLaunched }: { onLaunched: () => void }) {
         >
           停止
         </button>
+        <button
+          onClick={() => {
+            try { window.localStorage.removeItem("archaea.sim-config"); } catch { /* ignore */ }
+            window.location.reload();
+          }}
+          className="px-3 py-2 rounded-md text-xs font-medium bg-slate-800/60 hover:bg-slate-700 text-slate-300"
+          title="清空浏览器中保存的设置并刷新页面"
+        >
+          重置默认
+        </button>
         {status?.running && (
           <span className="text-sm text-slate-400 numeric">
             正在跑：seed={status.config?.seed} · pop_max={status.config?.pop_max}{" "}
@@ -187,6 +227,8 @@ export function SetupPage({ onLaunched }: { onLaunched: () => void }) {
           </span>
         )}
       </div>
+
+      <SlimePanel cfg={cfg} setCfg={setCfg} />
 
       <div className="mt-10 rounded-lg border border-slate-800 bg-slate-900/50 p-5 text-sm leading-relaxed text-slate-300">
         <h2 className="text-base font-semibold text-slate-100 mb-2">
@@ -254,6 +296,26 @@ function FieldRow({
             }}
             className="w-full bg-slate-950 border border-slate-700 rounded px-2 py-1.5 text-sm font-mono numeric"
           />
+        ) : field.key === "calibration_lambda" ? (
+          <input
+            type="number"
+            min={0}
+            max={5}
+            step={0.05}
+            value={(value as number | null) ?? 0}
+            onChange={(e) => onChange(Number(e.target.value) as never)}
+            className="w-full bg-slate-950 border border-slate-700 rounded px-2 py-1.5 text-sm font-mono numeric"
+          />
+        ) : field.key === "synapse_gain" ? (
+          <input
+            type="number"
+            min={0.1}
+            max={20}
+            step={0.1}
+            value={(value as number | null) ?? 1}
+            onChange={(e) => onChange(Number(e.target.value) as never)}
+            className="w-full bg-slate-950 border border-slate-700 rounded px-2 py-1.5 text-sm font-mono numeric"
+          />
         ) : (
           <input
             type="number"
@@ -269,6 +331,162 @@ function FieldRow({
         </summary>
         <p className="mt-1 leading-relaxed">{field.detail}</p>
       </details>
+    </div>
+  );
+}
+
+interface SlimePanelProps {
+  cfg: SimConfig;
+  setCfg: (updater: (prev: SimConfig) => SimConfig) => void;
+}
+
+function SlimePanel({ cfg, setCfg }: SlimePanelProps) {
+  function set<K extends keyof SimConfig>(k: K, v: SimConfig[K]) {
+    setCfg((c) => ({ ...c, [k]: v }));
+  }
+  const enabled = cfg.slime_mold;
+  return (
+    <div className="mt-8 rounded-lg border border-fuchsia-700/40 bg-fuchsia-950/10 p-5">
+      <div className="flex items-center gap-3 mb-2">
+        <input
+          id="slime_mold"
+          type="checkbox"
+          checked={enabled}
+          onChange={(e) => set("slime_mold", e.target.checked)}
+          className="h-4 w-4 accent-fuchsia-400"
+        />
+        <label htmlFor="slime_mold" className="text-base font-semibold text-fuchsia-100">
+          🍄 启用赛博黏菌模式 (SPEC v1.1, off-SPEC)
+        </label>
+      </div>
+      <p className="text-xs text-fuchsia-200/70 leading-relaxed">
+        在 G×G 网格上给每个 agent 一个空间位置，引入三个相互耦合的"群体"机制：
+        <br />
+        ① <b>信息素场</b>（协作 / 共识形成）：强者沿轨迹释放信息素，留在浓痕处的 agent 奖励 ×(1+K)。
+        <br />
+        ② <b>HGT 横向基因转移</b>（社交 / 横向学习）：低 credit agent 概率性吸收邻居权重，模拟古菌真实生物机制。
+        <br />
+        ③ <b>趋化迁移</b>（社交 / 自组织）：agent 沿信息素梯度移动，自发形成"觅食网络"。
+        <br />
+        默认关闭 — 关闭时行为与 SPEC v1.0 完全一致。
+      </p>
+
+      <div
+        className={clsx(
+          "mt-4 grid grid-cols-2 lg:grid-cols-3 gap-3 transition-opacity",
+          !enabled && "opacity-40 pointer-events-none"
+        )}
+      >
+        <NumField label="网格边长" k="grid_size" cfg={cfg} setCfg={setCfg} step={1} />
+        <NumField
+          label="信息素挥发率"
+          k="pheromone_decay"
+          cfg={cfg}
+          setCfg={setCfg}
+          step={0.01}
+          help="每窗 *((1−r))，0.05 ≈ 半衰期 14 窗"
+        />
+        <NumField
+          label="扩散强度"
+          k="pheromone_diffusion"
+          cfg={cfg}
+          setCfg={setCfg}
+          step={0.05}
+          help="0..1, 4-邻域拉普拉斯，0.2 比较温和"
+        />
+        <NumField
+          label="释放速率"
+          k="pheromone_emit"
+          cfg={cfg}
+          setCfg={setCfg}
+          step={0.1}
+          help="emit_rate × max(0, r) 单位/窗"
+        />
+        <NumField
+          label="信息素奖励加成 K"
+          k="pheromone_bonus_k"
+          cfg={cfg}
+          setCfg={setCfg}
+          step={0.05}
+          help="reward × (1 + K × P_local/P_max)"
+        />
+
+        <BoolField label="启用 HGT" k="hgt_enabled" cfg={cfg} setCfg={set as never} />
+        <NumField
+          label="HGT 概率/窗"
+          k="hgt_prob"
+          cfg={cfg}
+          setCfg={setCfg}
+          step={0.005}
+          help="低 credit agent 每窗触发概率"
+        />
+        <NumField
+          label="HGT 融合系数"
+          k="hgt_blend"
+          cfg={cfg}
+          setCfg={setCfg}
+          step={0.05}
+          help="η = (1-η)·self + η·donor"
+        />
+
+        <BoolField label="启用迁移" k="migrate_enabled" cfg={cfg} setCfg={set as never} />
+        <NumField
+          label="迁移概率/窗"
+          k="migrate_prob"
+          cfg={cfg}
+          setCfg={setCfg}
+          step={0.05}
+          help="agent 每窗考虑沿梯度移动一格的概率"
+        />
+      </div>
+    </div>
+  );
+}
+
+interface NumFieldProps {
+  label: string;
+  k: keyof SimConfig;
+  cfg: SimConfig;
+  setCfg: (u: (p: SimConfig) => SimConfig) => void;
+  step?: number;
+  help?: string;
+}
+
+function NumField({ label, k, cfg, setCfg, step = 0.1, help }: NumFieldProps) {
+  return (
+    <div className="rounded border border-fuchsia-800/30 bg-fuchsia-950/20 p-2">
+      <div className="text-xs text-fuchsia-200/90">{label}</div>
+      <input
+        type="number"
+        step={step}
+        value={cfg[k] as number}
+        onChange={(e) =>
+          setCfg((c) => ({ ...c, [k]: Number(e.target.value) }) as SimConfig)
+        }
+        className="mt-1 w-full bg-slate-950 border border-fuchsia-700/40 rounded px-2 py-1 text-sm font-mono numeric"
+      />
+      {help && <div className="mt-1 text-[10px] text-fuchsia-200/50">{help}</div>}
+    </div>
+  );
+}
+
+interface BoolFieldProps {
+  label: string;
+  k: keyof SimConfig;
+  cfg: SimConfig;
+  setCfg: <K extends keyof SimConfig>(k: K, v: SimConfig[K]) => void;
+}
+
+function BoolField({ label, k, cfg, setCfg }: BoolFieldProps) {
+  return (
+    <div className="rounded border border-fuchsia-800/30 bg-fuchsia-950/20 p-2 flex items-center justify-between">
+      <span className="text-xs text-fuchsia-200/90">{label}</span>
+      <input
+        type="checkbox"
+        checked={cfg[k] as boolean}
+        onChange={(e) => setCfg(k, e.target.checked as never)}
+        className="h-4 w-4 accent-fuchsia-400"
+      />
     </div>
   );
 }

@@ -28,6 +28,34 @@ def pearson_r(f_in: np.ndarray, f_out: np.ndarray) -> float:
     return float((dx * dy).sum() / denom)
 
 
+def fitness_with_calibration_penalty(
+    f_in: np.ndarray, f_out: np.ndarray, calibration_lambda: float
+) -> float:
+    """SPEC v1.2 (off-SPEC) opt-in fitness with magnitude calibration.
+
+        fitness = pearson_r(f_in, f_out) - λ · |mean(f_out) - mean(f_in)| / std(f_in)
+
+    λ = 0  → exactly SPEC §4.1 (Pearson r only; affine-invariant, hence "compressed
+              outputs" still score perfectly).
+    λ > 0  → adds a *bias* penalty: groups whose mean output drifts from the input
+              mean lose fitness. With λ ≈ 0.3–0.5 the swarm is pushed toward
+              slope ≈ 1 (because the only way to keep the means aligned across
+              many windows is to actually match magnitudes).
+
+    Returns 0.0 in the same edge cases as ``pearson_r``.
+    """
+    r = pearson_r(f_in, f_out)
+    if calibration_lambda <= 0.0 or r == 0.0:
+        return r
+    x = np.asarray(f_in, dtype=np.float64)
+    y = np.asarray(f_out, dtype=np.float64)
+    fi_std = float(np.std(x))
+    if fi_std < 1e-9:
+        return r
+    bias = abs(float(np.mean(y)) - float(np.mean(x))) / fi_std
+    return float(r - calibration_lambda * bias)
+
+
 class Agent:
     """One evolvable SNN agent (topology fixed in L1)."""
 

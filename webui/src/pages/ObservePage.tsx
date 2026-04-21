@@ -3,6 +3,8 @@ import { useStore } from "../store";
 import { DotGrid } from "../components/DotGrid";
 import { AgentDetail } from "../components/AgentDetail";
 import { StatsTable } from "../components/StatsTable";
+import { CalibrationLambdaSlider } from "../components/CalibrationLambdaSlider";
+import { SynapseGainSlider } from "../components/SynapseGainSlider";
 import {
   BudgetChart,
   FitnessChart,
@@ -27,6 +29,10 @@ export function ObservePage() {
 
   return (
     <div className="max-w-[1500px] mx-auto p-4 grid gap-4 grid-cols-12">
+      <div className="col-span-12 grid grid-cols-1 xl:grid-cols-2 gap-3">
+        <CalibrationLambdaSlider initial={status?.config?.calibration_lambda ?? 0} />
+        <SynapseGainSlider initial={status?.config?.synapse_gain ?? 1} />
+      </div>
       {/* 左大块：dot grid */}
       <section className="col-span-12 lg:col-span-8 space-y-4">
         <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-3">

@@ -39,6 +39,9 @@ LOG_TABLE_COLUMNS = (
     "weight_std",
     "sigma",
     "budget_pressure",
+    "phero_max",
+    "hgt",
+    "moves",
 )
 
 

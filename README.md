@@ -227,6 +227,110 @@ python -m archaea.visualize --seed 42 --duration 120 \
 
 ---
 
+### 🍄 赛博黏菌 / Cyber Slime Mold（SPEC v1.1，off-SPEC，可选）
+
+> **动机**：SPEC v1.0 跑出来的"种群"本质上是**并行评估池**——所有 agent 看同样的输入，互相不通信，仅通过资源/槽位**间接竞争**。"群体"的存在感很弱：去掉除了 top-10 之外的所有个体，几乎不损失任何东西。
+>
+> v1.1 在不破坏 v1.0 evolutionary core 的前提下，加入**三个相互耦合的群体机制**，把这个"评估池"改造成一个**真正的去中心化协作系统**。设计哲学：保留 agent 个体性（不是单一大脑），通过**间接通信信道**让群体涌现出"觅食网络"般的自组织结构。
+
+#### 三个机制 = Agent 三要素的两条短板补全
+
+| 机制 | 对应 | 生物学原型 |
+|---|---|---|
+| **信息素场** (pheromone field) | **协作** (stigmergy) | *Physarum* 的化学轨迹 |
+| **HGT** (horizontal gene transfer) | **社交** (lateral learning) | 古菌真实生物机制 |
+| **趋化迁移** (chemotaxis) | **社交 + 协作** | 黏菌沿梯度移动 |
+
+繁殖（突变）已经在 v1.0 完整实现；v1.1 补全的是社交和协作。
+
+#### 1. 信息素场（协作 / 共识形成）
+
+把种群放在 G×G 的环面网格上（默认 16×16）。每窗顺序：
+
+1. **感知 → 奖励放大**：站在浓痕格子上的 agent，奖励 ×(1 + K · P_local / P_max)。这是**正反馈**：高 fitness → 高 reward → 富足 → 留下浓痕 → 吸引更多 agent → 更高浓痕 → ...
+2. **HGT** 执行（见下）。
+3. **释放**：每个有定义 fitness 的 agent 在自己格子留下 `emit × max(0, r)` 的信息素。
+4. **挥发 + 扩散**：`P ← (1−decay) · P` 然后 `P ← P + diffusion · Laplacian(P)`（4-邻域、周期边界）。默认 decay=0.05（半衰期约 14 窗 = 7s）、diffusion=0.20。
+5. **趋化迁移** 执行。
+
+#### 2. HGT 横向基因转移（社交 / 横向学习）
+
+每个低 credit agent 每窗有 `hgt_prob`（默认 2%）概率，在 Chebyshev 半径内查找 credit ≥ `hgt_donor_ratio`（默认 2×）倍于自己的邻居。匹配则：
+
+```
+W_self ← (1 − η) · W_self + η · W_donor       η = hgt_blend = 0.30
+credit_self ← credit_self − hgt_cost          hgt_cost = 5.0
+fitness_history_self ← cleared (40 窗重新累计)
+```
+
+历史清零是关键：旧的 (f_in, f_out) 记录已经不能反映新权重，必须从头测量。
+
+这是**非繁殖的横向学习**——SPEC v1.0 里只有"父→子"的纵向传递，HGT 让群体级别的"知识"以非血缘方式扩散，可以救回低 credit agent，避免基因池过早收敛。
+
+#### 3. 趋化迁移（社交 / 自组织）
+
+每个 agent 每窗 `migrate_prob`（默认 30%）概率沿信息素梯度走一格（3×3 Moore 邻域 argmax，含原地不动）。配合信息素场，群体会自发形成"觅食网络"——和真实 *Physarum* 在培养皿里寻找最短路径几乎一模一样。
+
+#### CLI 启用
+
+```bash
+# 100 个个体在 16×16 网格上跑赛博黏菌，30 秒
+python -m archaea.run --seed 42 --duration 30 \
+    --pop-max 200 --n-initial 100 \
+    --slime-mold \
+    --log run.log
+
+# 全套调参（保留默认即可，下面只是展示开关位置）
+python -m archaea.run --seed 42 --duration 300 \
+    --pop-max 200 --n-initial 100 \
+    --slime-mold --grid-size 16 \
+    --pheromone-decay 0.05 --pheromone-diffusion 0.20 \
+    --pheromone-emit 0.5 --pheromone-bonus 0.5 \
+    --hgt-prob 0.02 --hgt-blend 0.30 \
+    --migrate-prob 0.30 \
+    --log run.log
+```
+
+可与共享预算叠加（"资源稀缺 + 自组织觅食"）：
+
+```bash
+python -m archaea.run --seed 42 --duration 600 \
+    --pop-max 500 --n-initial 100 \
+    --slime-mold \
+    --carrying-capacity 30 --budget-mode shared \
+    --log run.log
+```
+
+#### 日志新增 3 列
+
+`run.log` 在原有列后追加：
+
+```
+... weight_std  sigma  budget_pressure  phero_max  hgt  moves
+```
+
+- `phero_max`：当前最强信息素细胞值（衡量"觅食网络"的强度）。
+- `hgt`：本窗 HGT 事件数。
+- `moves`：本窗趋化迁移次数。
+
+#### WebUI 视觉
+
+- **观测页**自动检测 slime 模式 → 点阵区域切换为**真实空间布局**：
+  - 背景 = 信息素热力图（深蓝 → 紫 → 琥珀色，越亮信息素越强）
+  - dot 按 (x, y) 放在对应网格里，多 agent 同格自动散布
+  - 上方信息条多了 P_max / HGT / 移动次数三个实时数字
+- **统计表**自动追加 4 行（pheromone_max / pheromone_mean / hgt_count / migrations）
+- **Agent 详情**面板显示该 agent 当前 (x, y) 与 local pheromone
+
+#### 与 SPEC 的关系
+
+- 默认关闭。`--slime-mold` 不开 → 行为与 SPEC v1.0 **byte-identical**（由 `tests/test_slime.py::test_population_slime_disabled_matches_default_behaviour` 守护）。
+- 开启后属于 SPEC v1.1 扩展（formal spec 见 `SPEC.md` §13）。
+- 三个机制都不修改 §1–§6 的 agent 拓扑、SNN 动力学、繁殖突变规则。仅在 §4.4 的奖励分配上叠了一层乘子，加了 §5 的繁殖位置约束（child 落在 parent 1 格内），并新增了 HGT/迁移/信息素三个独立子系统。
+- 接受度判据 (§7.2 的 r ≥ 0.7) **不变**。这一扩展是研究装置：**问的是"去中心化协作能不能跑赢纯个体选择，会涌现什么样的结构"**，而不是工程交付目标。
+
+---
+
 ## Live dashboard（可选实时图形）
 
 两块面板：

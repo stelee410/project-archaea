@@ -13,6 +13,7 @@ import numpy as np
 from . import telemetry
 from .champions import save_champions
 from .population import Population
+from .slime import SlimeConfig
 from .telemetry import (
     StdoutRollingTable,
     dump_t2h_top10_csv,
@@ -45,6 +46,9 @@ def run_experiment(
     console_rows: int = 100,
     carrying_capacity: int | None = None,
     budget_mode: str = "none",
+    slime: SlimeConfig | None = None,
+    calibration_lambda: float = 0.0,
+    synapse_gain: float = 1.0,
 ) -> int:
     """
     Returns process exit code: 0 on success halt, 1 on failure/pathology.
@@ -57,6 +61,9 @@ def run_experiment(
         n_initial=n_initial,
         carrying_capacity=carrying_capacity,
         budget_mode=budget_mode,
+        slime=slime,
+        calibration_lambda=calibration_lambda,
+        synapse_gain=synapse_gain,
     )
 
     if visual:
@@ -122,6 +129,9 @@ def run_experiment(
                 f"{pop.weight_diversity_metric():.6f}",
                 f"{sigma:.6f}",
                 f"{float(info.get('budget_pressure', 0.0)):.6f}",
+                f"{float(info.get('pheromone_max', 0.0)):.4f}",
+                int(info.get('hgt_count', 0)),
+                int(info.get('migrations', 0)),
             ]
             log_fields(row)
 
@@ -293,9 +303,60 @@ def main(argv: list[str] | None = None) -> int:
             "modelling finite resources / ecological carrying capacity."
         ),
     )
+    # ── Slime-mold extension (SPEC v1.1, off-SPEC, opt-in) ──
+    p.add_argument(
+        "--slime-mold",
+        action="store_true",
+        help="[v1.1 off-SPEC] Enable cyber-slime-mold mode: spatial grid, pheromone field, HGT, chemotaxis.",
+    )
+    p.add_argument("--grid-size", type=int, default=16, help="[slime] G×G petri-dish grid size.")
+    p.add_argument("--pheromone-decay", type=float, default=0.05, help="[slime] Per-window decay rate (0..1).")
+    p.add_argument("--pheromone-diffusion", type=float, default=0.20, help="[slime] Per-window 4-neighbour diffusion (0..1).")
+    p.add_argument("--pheromone-emit", type=float, default=0.5, help="[slime] Emission rate per fitness unit per window.")
+    p.add_argument("--pheromone-bonus", type=float, default=0.5, help="[slime] Reward multiplier on a saturated trail (0..).")
+    p.add_argument("--no-hgt", action="store_true", help="[slime] Disable horizontal gene transfer.")
+    p.add_argument("--hgt-prob", type=float, default=0.02, help="[slime] Per-agent per-window HGT trigger probability.")
+    p.add_argument("--hgt-blend", type=float, default=0.30, help="[slime] Donor blend fraction in HGT.")
+    p.add_argument("--no-migrate", action="store_true", help="[slime] Disable chemotaxis migration.")
+    p.add_argument("--migrate-prob", type=float, default=0.30, help="[slime] Per-agent per-window migration probability.")
+    p.add_argument(
+        "--calibration-lambda",
+        type=float,
+        default=0.0,
+        help=(
+            "[v1.2 off-SPEC] Fitness magnitude calibration penalty λ. "
+            "0 = SPEC §4.1 pure Pearson r (allows compressed outputs). "
+            ">0 (try 0.3–0.5) penalises mean(f_out) drifting from mean(f_in), "
+            "pushing the swarm toward slope ≈ 1 (output magnitude matches input)."
+        ),
+    )
+    p.add_argument(
+        "--synapse-gain",
+        type=float,
+        default=1.0,
+        help=(
+            "[v1.2 off-SPEC] Output-layer synaptic gain g. "
+            "1.0 = SPEC §1.1 bit-identical. >1 multiplies I_o, raising raw f_out by "
+            "literally producing more output spikes (subject to LIF refractory limits). "
+            "Try 2.0–4.0 if the population's raw output saturates well below f_in."
+        ),
+    )
     args = p.parse_args(argv)
 
     os.chdir(Path(__file__).resolve().parents[1])
+    slime_cfg = SlimeConfig(
+        enabled=bool(args.slime_mold),
+        grid_size=int(args.grid_size),
+        pheromone_decay=float(args.pheromone_decay),
+        pheromone_diffusion=float(args.pheromone_diffusion),
+        pheromone_emit=float(args.pheromone_emit),
+        pheromone_bonus_k=float(args.pheromone_bonus),
+        hgt_enabled=(not bool(args.no_hgt)),
+        hgt_prob=float(args.hgt_prob),
+        hgt_blend=float(args.hgt_blend),
+        migrate_enabled=(not bool(args.no_migrate)),
+        migrate_prob=float(args.migrate_prob),
+    )
     return run_experiment(
         seed=args.seed,
         duration_s=args.duration,
@@ -309,6 +370,9 @@ def main(argv: list[str] | None = None) -> int:
         console_rows=int(args.console_rows),
         carrying_capacity=int(args.carrying_capacity) or None,
         budget_mode=str(args.budget_mode),
+        slime=slime_cfg,
+        calibration_lambda=float(args.calibration_lambda),
+        synapse_gain=float(args.synapse_gain),
     )
 
 

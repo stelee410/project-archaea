@@ -79,19 +79,31 @@ class NetworkBatch:
     Batched 10→20→1 networks: weights (N, 220), same input spikes for all agents.
     """
 
-    __slots__ = ("n_agents", "w_ih", "w_ho", "hidden", "out")
+    __slots__ = ("n_agents", "w_ih", "w_ho", "hidden", "out", "output_gain")
 
-    def __init__(self, weights: np.ndarray, rng: np.random.Generator | None = None):
+    def __init__(
+        self,
+        weights: np.ndarray,
+        rng: np.random.Generator | None = None,
+        output_gain: float = 1.0,
+    ):
         """
         weights: (N, 220)
+        output_gain: SPEC v1.2 (off-SPEC) output-layer synaptic gain g.
+            I_o[t] = I_in · g · Σ_j W_ho[j] · h_spike[t,j]
+            g = 1.0 (default) → bit-identical to SPEC §1.1.
+            g > 1   raises raw f_out by literally producing more spikes.
         """
         w = np.asarray(weights, dtype=np.float64)
         if w.ndim != 2 or w.shape[1] != N_WEIGHTS:
             raise ValueError(f"weights must be (N, {N_WEIGHTS}), got {w.shape}")
+        if output_gain <= 0.0:
+            raise ValueError("output_gain must be > 0")
         self.n_agents = w.shape[0]
         self.w_ih, self.w_ho = unpack_weights(w)
         self.hidden = LIFState(self.n_agents, N_HIDDEN, rng)
         self.out = LIFState(self.n_agents, N_OUTPUT, rng)
+        self.output_gain = float(output_gain)
 
     def reset(self, rng: np.random.Generator | None = None) -> None:
         self.hidden = LIFState(self.n_agents, N_HIDDEN, rng)
@@ -107,8 +119,12 @@ class NetworkBatch:
         # I_h = I_in * sum_i W_ij * s_i  -> (N, 20)
         ih = I_IN * (self.w_ih * s.reshape(1, N_INPUT, 1)).sum(axis=1)
         h_spike = self.hidden.step(ih)
-        # I_o = I_in * sum_j W_j * h_j
-        io = I_IN * (self.w_ho * h_spike.reshape(self.n_agents, N_HIDDEN, 1)).sum(axis=1)
+        # I_o = I_in * g * sum_j W_j * h_j
+        io = (
+            I_IN
+            * self.output_gain
+            * (self.w_ho * h_spike.reshape(self.n_agents, N_HIDDEN, 1)).sum(axis=1)
+        )
         return self.out.step(io)
 
 
@@ -138,9 +154,14 @@ class DirectLIF10to1:
 class NetworkSingle:
     """Single network (N=1) convenience wrapper."""
 
-    def __init__(self, weights: np.ndarray, rng: np.random.Generator | None = None):
+    def __init__(
+        self,
+        weights: np.ndarray,
+        rng: np.random.Generator | None = None,
+        output_gain: float = 1.0,
+    ):
         w = np.atleast_2d(np.asarray(weights, dtype=np.float64))
-        self._batch = NetworkBatch(w, rng)
+        self._batch = NetworkBatch(w, rng, output_gain=output_gain)
 
     def reset(self, rng: np.random.Generator | None = None) -> None:
         self._batch.reset(rng)

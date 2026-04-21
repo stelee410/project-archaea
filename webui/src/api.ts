@@ -8,6 +8,8 @@ import type {
   ServerEvent,
   SimConfig,
   SimStatus,
+  SweepRequest,
+  SweepResponse,
 } from "./types";
 
 const J = { "Content-Type": "application/json" };
@@ -37,6 +39,13 @@ export const api = {
   stop: () => jpost<SimStatus>("/api/stop", {}),
   inference: (req: InferenceRequest) =>
     jpost<InferenceResponse>("/api/inference", req),
+  sweep: (req: SweepRequest) => jpost<SweepResponse>("/api/sweep", req),
+  setCalibrationLambda: (calibration_lambda: number) =>
+    jpost<{ calibration_lambda: number }>("/api/calibration-lambda", {
+      calibration_lambda,
+    }),
+  setSynapseGain: (synapse_gain: number) =>
+    jpost<{ synapse_gain: number }>("/api/synapse-gain", { synapse_gain }),
   feedback: (req: FeedbackRequest) =>
     jpost<FeedbackResponse>("/api/feedback", req),
   agent: (slot: number) => jget<AgentDetail>(`/api/agent/${slot}`),

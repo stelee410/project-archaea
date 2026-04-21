@@ -1,8 +1,10 @@
-# Project Archaea — L1 Engineering Contract (SPEC v1.0)
+# Project Archaea — L1 Engineering Contract (SPEC v1.0 + v1.1 extensions)
 
 > **Scope discipline.** This document specifies L1 only: evolving a population of spiking-neural-network agents such that their single output neuron's firing rate tracks the input firing rate (Pearson r > 0.7). It does **not** cover arithmetic, topology evolution, or crossover. Those are later phases and are explicitly out of scope.
 
-> **Implementation note (off-SPEC extension).** The runner ships an opt-in *shared-budget / carrying-capacity* mode (CLI: `--budget-mode shared --carrying-capacity K`) that **extends** §4.4 to model finite resources (`B = K × R_MAX` per window, distributed proportionally to demand with a haircut when oversubscribed). It is **disabled by default** so the SPEC behavior is preserved bit-for-bit; see `README.md` § "承载力 / 共享预算" for the full description, motivation, and equilibrium math.
+> **Implementation note (off-SPEC extension #1).** The runner ships an opt-in *shared-budget / carrying-capacity* mode (CLI: `--budget-mode shared --carrying-capacity K`) that **extends** §4.4 to model finite resources (`B = K × R_MAX` per window, distributed proportionally to demand with a haircut when oversubscribed). It is **disabled by default** so the SPEC behavior is preserved bit-for-bit; see `README.md` § "承载力 / 共享预算" for the full description, motivation, and equilibrium math.
+
+> **Implementation note (off-SPEC extension #2 — SPEC v1.1, Cyber Slime Mold).** The runner also ships an opt-in *cyber slime mold* mode (CLI: `--slime-mold`) that adds three biology-inspired social/cooperative mechanisms on top of the SPEC v1.0 evolutionary core: a **2D petri-dish grid** with per-agent (x, y) positions; a **pheromone field** (stigmergic cooperation — strong agents leave trails that boost the reward of agents standing on them); **horizontal gene transfer (HGT)** (lateral weight exchange between proximate agents with a credit asymmetry, mimicking actual archaea biology); and **chemotaxis migration** (agents step along the pheromone gradient, self-organizing into "foraging networks"). Like #1 it is **disabled by default**; when off, behavior is bit-identical to SPEC v1.0. See `README.md` § "赛博黏菌 / Cyber Slime Mold" for the full mechanism description and §13 below for the formal spec.
 
 ---
 
@@ -386,3 +388,85 @@ The L1 contract is complete when all of the following hold:
 5. Re-running with the same seed produces bit-identical `run.log`.
 
 Success on the biological objective (r > 0.7 achieved) is **not** part of the engineering contract. The contract delivers the apparatus; whether the apparatus produces evolution is the scientific question the apparatus exists to answer.
+
+---
+
+## 13. Cyber Slime Mold extension (SPEC v1.1, off-SPEC, opt-in)
+
+**Status.** Off by default. CLI `--slime-mold`. WebUI: "🍄 启用赛博黏菌模式" toggle on the Setup page. When `enabled=False`, this entire section is dormant and SPEC v1.0 behavior is preserved bit-for-bit (verified by `test_population_slime_disabled_matches_default_behaviour` in `tests/test_slime.py`).
+
+**Motivation.** SPEC v1.0 implements a *parallel evolutionary search pool*: N independent agents see the same input and are selected on individual fitness. There is no genuine "群体 > 个体" emergence — removing all but the top 10 agents loses essentially nothing. v1.1 adds three coupled mechanisms — modeled on actual *Physarum polycephalum* and *Archaea* biology — that turn the population into a self-organizing **collective**:
+
+| Mechanism | Agent-three-element role | Biological referent |
+|---|---|---|
+| Pheromone field | **协作 (cooperation, stigmergy)** | Slime-mold chemical trails |
+| Horizontal gene transfer | **社交 (social, lateral learning)** | Archaeal HGT |
+| Chemotaxis migration | **社交 + 协作** | Slime-mold gradient following |
+
+### 13.1 Spatial substrate
+
+A toroidal G×G grid (default G=16). Each agent gets an integer position `(x, y) ∈ [0,G)²`. Initial population is scattered uniformly; each child is placed within a 1-cell Chebyshev neighbourhood of its parent (clamped via wrap). Position has no effect when `slime.enabled=False`.
+
+### 13.2 Pheromone field P[x,y]
+
+A non-negative float field over the grid. Per window, in this exact order:
+
+1. **Sense → reward bonus** (before reward credit posts):
+   ```
+   P_local_i  = P[x_i, y_i]
+   bonus_i    = 1 + κ × (P_local_i / P_max)         κ = pheromone_bonus_k
+   reward_i  *= bonus_i
+   ```
+   where `P_max = max(P)` from the *previous* window's field; `bonus_i = 1` if the field is empty. This makes "standing on a trail" pay better, creating positive feedback for clustering.
+
+2. **HGT** (see §13.3) executes after reward, before death.
+
+3. **Emit** (after reproduction has settled into the new positions):
+   ```
+   P[x_i, y_i] += emit_rate × max(0, r_i)            for all living agents
+   ```
+   Only fitness-defined agents leave trails; stronger trackers leave heavier marks.
+
+4. **Decay + diffuse**:
+   ```
+   P  ← P × (1 − decay)
+   P  ← P + diffusion × Laplacian(P)            (4-neighbour, periodic)
+   P  ← max(P, 0)
+   ```
+   Default `decay=0.05` (half-life ≈ 14 windows = 7 s), `diffusion=0.20`. The discrete Laplacian uses the convention `0.25·(N+S+E+W) − P`, which conserves total mass when `decay=0`.
+
+5. **Chemotaxis** (see §13.4) executes last.
+
+### 13.3 Horizontal gene transfer (HGT)
+
+For each living agent (recipient) independently, with probability `hgt_prob` per window, look up donors within Chebyshev radius `hgt_radius` whose credit ≥ `hgt_donor_ratio × my_credit`. Pick the richest such donor (random tie-break). On match:
+
+```
+W_recipient ← (1 − η) × W_recipient + η × W_donor      η = hgt_blend
+credit_recipient ← credit_recipient − hgt_cost
+fitness_history_recipient ← cleared (40 windows of regrowth required)
+```
+
+The history flush is load-bearing: the agent's old (f_in, f_out) record is no longer faithful to its new weights, so its fitness must reaccumulate from scratch. Recipient is skipped if `credit_recipient ≤ hgt_cost` (cannot afford the absorption).
+
+Defaults: `hgt_prob=0.02`, `hgt_blend=0.30`, `hgt_radius=1`, `hgt_cost=5.0`, `hgt_donor_ratio=2.0`.
+
+### 13.4 Chemotaxis migration
+
+For each living agent, with probability `migrate_prob`, evaluate the pheromone value at all 9 cells in its 3×3 (Moore) neighbourhood (including self) and step to the argmax (random tie-break). Tiny uniform noise is added before argmax so persistent ties don't deadlock. Default `migrate_prob=0.30`. Movement is at most one cell per window.
+
+### 13.5 Telemetry additions
+
+Three new columns appended to the SPEC §8.1 log line (preserved order; no existing columns are renamed or moved):
+
+```
+... weight_std  sigma  budget_pressure  phero_max  hgt  moves
+```
+
+WebUI telemetry events additionally carry the full `pheromone[G][G]` grid and `positions[pop_max][2]` array per window for live heatmap rendering.
+
+### 13.6 Acceptance / non-criteria
+
+The slime-mold extension does **not** modify the success criterion (§7.2 still requires `r ≥ 0.7` over a 40-window window for at least one agent). It is intended as a research apparatus for the question *"can decentralised collective dynamics outperform pure individual selection at the SPEC v1.0 task, and what kind of structure emerges?"* — not as an engineering deliverable.
+
+The only hard contract for v1.1 is: with `enabled=False`, every observable (every `run.log` line, every checkpoint, every halt diagnostic) is byte-identical to SPEC v1.0. This is enforced by `test_population_slime_disabled_matches_default_behaviour`.
