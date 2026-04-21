@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import clsx from "clsx";
 import { api } from "../api";
+import { usePersistentState } from "../hooks/usePersistentState";
 
 /**
  * Live slider for the fitness magnitude calibration penalty λ (SPEC v1.2 off-SPEC).
@@ -11,20 +12,64 @@ import { api } from "../api";
  *
  * Updates are debounced 250 ms so dragging the slider doesn't spam the backend.
  * The change takes effect from the *next* simulation window onward — no restart.
+ *
+ * The value is persisted to localStorage so it survives tab switches, page
+ * reloads and even browser restarts. When the slider mounts, if the persisted
+ * value differs from the server's current value (passed in via `initial`), we
+ * push the persisted value back to the server — this restores the user's last
+ * preference even if the backend process was restarted.
+ *
+ * SetupPage.launch() actively clears the persisted value when the user starts
+ * a new sim, so "stop + start" properly resets the slider to whatever value
+ * the setup form specifies.
  */
+export const CALIBRATION_LAMBDA_STORAGE_KEY = "live-calibration-lambda";
+
 export function CalibrationLambdaSlider({ initial }: { initial: number }) {
-  const [value, setValue] = useState<number>(initial);
+  const [persisted, setPersisted] = usePersistentState<number | null>(
+    CALIBRATION_LAMBDA_STORAGE_KEY,
+    null,
+  );
+  // UI value: localStorage wins over server `initial`.
+  const [value, setValue] = useState<number>(persisted ?? initial);
   const [busy, setBusy] = useState(false);
   const [serverValue, setServerValue] = useState<number>(initial);
   const [error, setError] = useState<string | null>(null);
   const debounceRef = useRef<number | null>(null);
-  const lastSentRef = useRef<number>(initial);
+  const lastSentRef = useRef<number>(persisted ?? initial);
+  const didMountSyncRef = useRef(false);
 
-  // Sync if parent's initial changes (e.g. after restart with new config).
+  // Mount-once: if the locally persisted value disagrees with the server,
+  // push the local one back so the server matches the user's last preference.
   useEffect(() => {
-    setValue(initial);
+    if (didMountSyncRef.current) return;
+    didMountSyncRef.current = true;
+    if (persisted != null && Math.abs(persisted - initial) > 1e-6) {
+      lastSentRef.current = persisted;
+      setBusy(true);
+      api
+        .setCalibrationLambda(persisted)
+        .then((r) => setServerValue(r.calibration_lambda))
+        .catch((e) => setError(String(e)))
+        .finally(() => setBusy(false));
+    }
+    // run once
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // If parent's `initial` changes (sim restarted → status.config refreshed),
+  // surface that as the new server-side value. We do NOT touch `value` here —
+  // either the persisted store has it (and was just cleared by SetupPage on
+  // restart, in which case persisted=null and we should follow the server),
+  // or the user is actively driving the slider.
+  useEffect(() => {
     setServerValue(initial);
-    lastSentRef.current = initial;
+    if (persisted == null) {
+      setValue(initial);
+      lastSentRef.current = initial;
+    }
+    // intentionally only depend on `initial` so user-driven changes don't loop
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [initial]);
 
   function commit(v: number) {
@@ -49,6 +94,7 @@ export function CalibrationLambdaSlider({ initial }: { initial: number }) {
 
   function onChange(v: number) {
     setValue(v);
+    setPersisted(v);
     commit(v);
   }
 

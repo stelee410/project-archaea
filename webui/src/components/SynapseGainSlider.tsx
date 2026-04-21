@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import clsx from "clsx";
 import { api } from "../api";
+import { usePersistentState } from "../hooks/usePersistentState";
 
 /**
  * Live slider for the output-layer synaptic gain g (SPEC v1.2 off-SPEC).
@@ -12,19 +13,51 @@ import { api } from "../api";
  *
  * Takes effect from the next simulation window AND the next inference call.
  * Debounced 250 ms.
+ *
+ * Persistence model: identical to CalibrationLambdaSlider. The slider value
+ * lives in localStorage (key below); on mount, if the local value disagrees
+ * with the server-reported `initial`, the local value is pushed back so the
+ * user's last preference survives tab switches, page reloads, and even
+ * backend restarts. Cleared by SetupPage.launch() so "stop + start" honours
+ * the new setup form value.
  */
+export const SYNAPSE_GAIN_STORAGE_KEY = "live-synapse-gain";
+
 export function SynapseGainSlider({ initial }: { initial: number }) {
-  const [value, setValue] = useState<number>(initial);
+  const [persisted, setPersisted] = usePersistentState<number | null>(
+    SYNAPSE_GAIN_STORAGE_KEY,
+    null,
+  );
+  const [value, setValue] = useState<number>(persisted ?? initial);
   const [busy, setBusy] = useState(false);
   const [serverValue, setServerValue] = useState<number>(initial);
   const [error, setError] = useState<string | null>(null);
   const debounceRef = useRef<number | null>(null);
-  const lastSentRef = useRef<number>(initial);
+  const lastSentRef = useRef<number>(persisted ?? initial);
+  const didMountSyncRef = useRef(false);
 
   useEffect(() => {
-    setValue(initial);
+    if (didMountSyncRef.current) return;
+    didMountSyncRef.current = true;
+    if (persisted != null && Math.abs(persisted - initial) > 1e-6) {
+      lastSentRef.current = persisted;
+      setBusy(true);
+      api
+        .setSynapseGain(persisted)
+        .then((r) => setServerValue(r.synapse_gain))
+        .catch((e) => setError(String(e)))
+        .finally(() => setBusy(false));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
     setServerValue(initial);
-    lastSentRef.current = initial;
+    if (persisted == null) {
+      setValue(initial);
+      lastSentRef.current = initial;
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [initial]);
 
   function commit(v: number) {
@@ -47,6 +80,7 @@ export function SynapseGainSlider({ initial }: { initial: number }) {
 
   function onChange(v: number) {
     setValue(v);
+    setPersisted(v);
     commit(v);
   }
 

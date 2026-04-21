@@ -3,6 +3,8 @@ import clsx from "clsx";
 import { api } from "../api";
 import { useStore } from "../store";
 import { usePersistentState } from "../hooks/usePersistentState";
+import { CALIBRATION_LAMBDA_STORAGE_KEY } from "../components/CalibrationLambdaSlider";
+import { SYNAPSE_GAIN_STORAGE_KEY } from "../components/SynapseGainSlider";
 import type { BudgetMode, SimConfig } from "../types";
 
 interface FieldDoc {
@@ -141,6 +143,16 @@ export function SetupPage({ onLaunched }: { onLaunched: () => void }) {
       resetHistory();
       const next = await api.start(cfg);
       setStatus(next);
+      // Sim was just (re)started → discard the user's previous live-tuned
+      // λ / g overrides so the sliders reflect the freshly-applied setup
+      // values. Without this clearing, the sliders would keep pushing the
+      // *old* values right back to the new sim on next mount.
+      try {
+        window.localStorage.removeItem(`archaea.${CALIBRATION_LAMBDA_STORAGE_KEY}`);
+        window.localStorage.removeItem(`archaea.${SYNAPSE_GAIN_STORAGE_KEY}`);
+      } catch {
+        /* quota / privacy mode — non-fatal */
+      }
       onLaunched();
     } catch (e) {
       setError(String(e));
