@@ -20,7 +20,7 @@ from typing import Any
 import numpy as np
 
 from .economy import BUDGET_MODE_NONE, R_MAX
-from .neuron import N_INPUT, NetworkSingle, unpack_weights
+from .neuron import N_INPUT, NetworkBatch, NetworkSingle, unpack_weights
 from .population import Population
 from .slime import SlimeConfig
 from .stimulus import poisson_spikes_window
@@ -444,37 +444,48 @@ class SimulationRuntime:
         meta_size_first = n_agents if target == "swarm" else None
 
         # ── Step 2: All SNN work OUTSIDE the lock ────────────────────────────
+        # Vectorize across the agent dimension: build one NetworkBatch holding
+        # all selected agents and step it once per ms (instead of N_AGENTS × T
+        # per-agent Python calls). For the large branches (ensemble/swarm) this
+        # is a 10× – 50× speedup; for best (A=1) it is a no-op.
+        weights_stack = np.stack(weights_per, axis=0)  # (A, 220)
+        duration_s = float(duration_ms) / 1000.0
+        warmup_steps = int(round(float(warmup_ms))) if warmup_ms > 0 else 0
+        duration_steps = int(round(float(duration_ms)))
+
         points: list[dict[str, Any]] = []
         for f in f_ins:
-            outs: list[float] = []
             f_in = float(max(0.0, f))
+            outs_mean: list[float] = []  # mean across agents, per repeat
             for _ in range(rep):
-                per_agent: list[float] = []
-                for w in weights_per:
-                    net = NetworkSingle(
-                        w, rng=np.random.default_rng(), output_gain=inference_gain
+                # Reset shared batch state for this (f, repeat).
+                net = NetworkBatch(
+                    weights_stack,
+                    rng=np.random.default_rng(),
+                    output_gain=inference_gain,
+                )
+                if warmup_steps > 0:
+                    wsp = poisson_spikes_window(
+                        self._inference_rng, f_in, float(warmup_ms), N_INPUT
                     )
-                    if warmup_ms > 0:
-                        wsp = poisson_spikes_window(
-                            self._inference_rng, f_in, float(warmup_ms), N_INPUT
-                        )
-                        for t in range(wsp.shape[0]):
-                            net.step(wsp[t])
-                    spikes = poisson_spikes_window(
-                        self._inference_rng, f_in, float(duration_ms), N_INPUT
-                    )
-                    cnt = 0
-                    for t in range(spikes.shape[0]):
-                        if net.step(spikes[t]) > 0.0:
-                            cnt += 1
-                    per_agent.append(cnt / (duration_ms / 1000.0))
-                outs.append(float(np.mean(per_agent)))
+                    for t in range(warmup_steps):
+                        net.step(wsp[t])
+                spikes = poisson_spikes_window(
+                    self._inference_rng, f_in, float(duration_ms), N_INPUT
+                )
+                # Per-agent spike counts across the measurement window.
+                counts = np.zeros(n_agents, dtype=np.int64)
+                for t in range(duration_steps):
+                    out_spikes = net.step(spikes[t])  # (A, 1)
+                    counts += (out_spikes[:, 0] > 0.0).astype(np.int64)
+                per_agent_hz = counts.astype(np.float64) / duration_s  # (A,)
+                outs_mean.append(float(per_agent_hz.mean()))
             points.append(
                 {
                     "f_in_hz": f_in,
-                    "f_out_hz_mean": float(np.mean(outs)),
-                    "f_out_hz_std": float(np.std(outs)) if rep > 1 else 0.0,
-                    "f_out_hz_per_repeat": outs,
+                    "f_out_hz_mean": float(np.mean(outs_mean)),
+                    "f_out_hz_std": float(np.std(outs_mean)) if rep > 1 else 0.0,
+                    "f_out_hz_per_repeat": outs_mean,
                     "n_agents": n_agents,
                 }
             )
