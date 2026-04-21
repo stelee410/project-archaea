@@ -14,6 +14,7 @@ import {
 import { api } from "../api";
 import { useStore } from "../store";
 import { usePersistentState } from "../hooks/usePersistentState";
+import { LiveTrackCard } from "../components/LiveTrackCard";
 import type { InferenceResponse, SweepResponse } from "../types";
 
 interface InteractionRow {
@@ -402,6 +403,12 @@ export function UsePage() {
             </button>
           </div>
         </div>
+
+        <LiveTrackCard
+          target={target}
+          topK={topK}
+          swarmRadius={swarmRadius}
+        />
 
         <SweepCard
           form={sweepForm}
