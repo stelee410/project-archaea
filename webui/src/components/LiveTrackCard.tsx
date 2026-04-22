@@ -9,12 +9,14 @@ import { usePersistentState } from "../hooks/usePersistentState";
  * The user moves the mouse over an SVG canvas; the cursor's vertical position
  * is sampled as the input frequency f_in (Hz) and shipped to /api/inference
  * in a tight back-to-back loop. The returned f_out is appended to a rolling
- * time series. Both signals are drawn against a shared time axis that scrolls
- * to the left as new samples come in.
+ * buffer that **only ever holds the last `MAX_SAMPLES` points**. The time
+ * axis auto-fits the actual range of those points, so the curve always fills
+ * the chart and rendering cost is bounded regardless of how long the panel
+ * has been open.
  *
  * Visual hierarchy:
  *   • input (sky blue, dashed)        — what the swarm "sees"
- *   • output base (faded green path)  — full history within the time window
+ *   • output base (faded green path)  — full retained history
  *   • output head (bright thick green) — last N=5 samples, for instant feedback
  *   • last sample dot                  — pulses to show liveness
  *
@@ -23,6 +25,9 @@ import { usePersistentState } from "../hooks/usePersistentState";
  * never queue requests. When the cursor leaves the panel we idle (no API
  * traffic) but keep the chart on screen.
  */
+
+/** Upper bound on retained sample points. Keeps render cost & memory flat. */
+const MAX_SAMPLES = 10;
 
 interface Sample {
   t: number; // ms since session start
@@ -36,7 +41,6 @@ interface LiveTrackForm {
   yMax: number;
   durationMs: number;
   warmupMs: number;
-  windowSec: number;
 }
 
 const DEFAULTS: LiveTrackForm = {
@@ -44,7 +48,6 @@ const DEFAULTS: LiveTrackForm = {
   yMax: 150,
   durationMs: 80,
   warmupMs: 20,
-  windowSec: 8,
 };
 
 const HEAD_HIGHLIGHT = 5;
@@ -75,9 +78,6 @@ export function LiveTrackCard({ target, topK, swarmRadius }: Props) {
   const currentFinRef = useRef(0);
   const insideRef = useRef(false);
   const sessionStart = useRef(performance.now());
-  // Force a tick of the scrolling axis even between samples (so the chart
-  // doesn't visually freeze when the user holds the mouse still).
-  const [, setNowTick] = useState(0);
 
   function updateFromMouse(clientY: number, svg: SVGSVGElement) {
     const rect = svg.getBoundingClientRect();
@@ -114,17 +114,18 @@ export function LiveTrackCard({ target, topK, swarmRadius }: Props) {
         if (cancelled) return;
         const tMid = (t0 + t1) / 2 - sessionStart.current;
         setSamples((prev) => {
-          const next = prev.concat({
+          const sample: Sample = {
             t: tMid,
             f_in,
             f_out: r.f_out_hz,
             latency_ms: t1 - t0,
-          });
-          const cutoff = tMid - formRef.current.windowSec * 1000 * 1.2;
-          // tiny extra slack so the curve doesn't visibly snap at the edge
-          let drop = 0;
-          while (drop < next.length && next[drop].t < cutoff) drop++;
-          return drop > 0 ? next.slice(drop) : next;
+          };
+          // Bounded ring: keep only the most recent MAX_SAMPLES points so
+          // memory and SVG draw cost stay flat regardless of session length.
+          if (prev.length < MAX_SAMPLES) return prev.concat(sample);
+          const next = prev.slice(prev.length - (MAX_SAMPLES - 1));
+          next.push(sample);
+          return next;
         });
       } catch {
         // swallow transient errors; the loop must keep running
@@ -136,18 +137,6 @@ export function LiveTrackCard({ target, topK, swarmRadius }: Props) {
       cancelled = true;
       if (timer != null) clearTimeout(timer);
     };
-  }, [form.enabled]);
-
-  // Animate the time axis even when no new samples arrive (smooth scroll).
-  useEffect(() => {
-    if (!form.enabled) return;
-    let raf = 0;
-    const loop = () => {
-      setNowTick((n) => (n + 1) & 0xffff);
-      raf = requestAnimationFrame(loop);
-    };
-    raf = requestAnimationFrame(loop);
-    return () => cancelAnimationFrame(raf);
   }, [form.enabled]);
 
   function clearSamples() {
@@ -165,42 +154,49 @@ export function LiveTrackCard({ target, topK, swarmRadius }: Props) {
   const innerW = W - ML - MR;
   const innerH = H - MT - MB;
   const yMax = form.yMax;
-  const wS = form.windowSec * 1000;
-  const tNow = performance.now() - sessionStart.current;
-  const tLeft = tNow - wS;
-  const xScale = (t: number) => ML + innerW * ((t - tLeft) / wS);
+  // X-axis auto-fits the actual time range of the retained samples (≤
+  // MAX_SAMPLES). With no samples we synthesize a 1 s placeholder window so
+  // the cursor f_in indicator still has somewhere to land.
+  const tFirst = samples.length > 0 ? samples[0].t : 0;
+  const tLast =
+    samples.length > 0 ? samples[samples.length - 1].t : tFirst + 1000;
+  const span = Math.max(500, tLast - tFirst);
+  const xPad = span * 0.04;
+  const xLeft = tFirst - xPad;
+  const xRight = tLast + xPad;
+  const xScale = (t: number) =>
+    ML + innerW * ((t - xLeft) / (xRight - xLeft));
   const yScale = (v: number) =>
     MT + innerH * (1 - Math.max(0, Math.min(1, v / Math.max(1, yMax))));
 
-  // Visible samples only (clip to window for path math)
-  const visible = samples.filter((s) => s.t >= tLeft - 200 && s.t <= tNow + 200);
-  const inputPts: [number, number][] = visible.map((s) => [
+  const inputPts: [number, number][] = samples.map((s) => [
     xScale(s.t),
     yScale(s.f_in),
   ]);
-  const outputPts: [number, number][] = visible.map((s) => [
+  const outputPts: [number, number][] = samples.map((s) => [
     xScale(s.t),
     yScale(s.f_out),
   ]);
   const headPts = outputPts.slice(-HEAD_HIGHLIGHT);
   const lastSample = samples.length > 0 ? samples[samples.length - 1] : null;
-  const lastN = samples.slice(-10);
   const meanLatency =
-    lastN.length > 0
-      ? lastN.reduce((a, b) => a + b.latency_ms, 0) / lastN.length
+    samples.length > 0
+      ? samples.reduce((a, b) => a + b.latency_ms, 0) / samples.length
       : 0;
+  const spanSec = (tLast - tFirst) / 1000;
 
   return (
     <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-5">
       <h2 className="text-base font-semibold mb-1">📡 实时跟随（鼠标驱动）</h2>
       <p className="text-xs text-slate-400 mb-3">
         在画板上<b>移动鼠标</b>：纵向位置 → 输入 <span className="text-sky-300">f_in</span>，
-        群体在线推理产生输出 <span className="text-emerald-300">f_out</span>，
-        曲线随时间向左滚动。最近 {HEAD_HIGHLIGHT} 个输出点用粗高亮平滑相连，最新一点呼吸闪动。
+        群体在线推理产生输出 <span className="text-emerald-300">f_out</span>。
+        画面只保留 <b>最近 {MAX_SAMPLES} 个采样点</b>（防止长时间运行越来越卡），
+        最近 {HEAD_HIGHLIGHT} 个输出点用粗高亮平滑相连，最新一点呼吸闪动。
         采样节奏由后端响应速度决定（请求一返回就立刻发下一个）。
       </p>
 
-      <div className="grid grid-cols-2 md:grid-cols-5 gap-3 mb-3">
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-3">
         <div>
           <label className="block text-xs text-slate-300 mb-1">启用</label>
           <button
@@ -249,18 +245,6 @@ export function LiveTrackCard({ target, topK, swarmRadius }: Props) {
             value={form.warmupMs}
             onChange={(e) =>
               setForm((s) => ({ ...s, warmupMs: Number(e.target.value) }))
-            }
-            className="num-input"
-          />
-        </Field>
-        <Field label="时间窗 (s)" hint="可视范围">
-          <input
-            type="number"
-            min={2}
-            max={30}
-            value={form.windowSec}
-            onChange={(e) =>
-              setForm((s) => ({ ...s, windowSec: Number(e.target.value) }))
             }
             className="num-input"
           />
@@ -334,7 +318,7 @@ export function LiveTrackCard({ target, topK, swarmRadius }: Props) {
             fill="#64748b"
             textAnchor="middle"
           >
-            ← 过去 {form.windowSec}s · 现在 →
+            最近 {samples.length}/{MAX_SAMPLES} 个采样点 · 跨度 ≈ {spanSec.toFixed(1)}s
           </text>
 
           {insidePanel && (
@@ -421,7 +405,8 @@ export function LiveTrackCard({ target, topK, swarmRadius }: Props) {
 
         <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-slate-400 mt-2 px-1">
           <span>
-            采样点 <b className="text-slate-200">{samples.length}</b>
+            缓冲 <b className="text-slate-200">{samples.length}</b>/{MAX_SAMPLES}{" "}
+            点
           </span>
           {lastSample && (
             <>
@@ -436,7 +421,7 @@ export function LiveTrackCard({ target, topK, swarmRadius }: Props) {
               <span>
                 推理延迟 ≈{" "}
                 <b className="text-slate-200">{meanLatency.toFixed(0)}</b> ms /
-                次（最近 10 次平均）
+                次（缓冲内平均）
               </span>
             </>
           )}
@@ -465,9 +450,11 @@ export function LiveTrackCard({ target, topK, swarmRadius }: Props) {
       </div>
 
       <div className="text-[10px] text-slate-500 mt-2 leading-snug">
-        蓝虚线 = 你给的输入；绿淡线 = 历史输出；绿粗线 = 最近{" "}
-        {HEAD_HIGHLIGHT} 个输出（呼吸点是最新一点）。曲线用 Catmull-Rom
-        样条平滑。注意输入与输出之间会有<b>固有延迟</b>≈ warmup + duration
+        蓝虚线 = 你给的输入；绿淡线 = 缓冲内全部 {MAX_SAMPLES}{" "}
+        个输出；绿粗线 = 最近 {HEAD_HIGHLIGHT}{" "}
+        个输出（呼吸点是最新一点）。曲线用 Catmull-Rom 样条平滑。X 轴随采样
+        自动适配，<b>缓冲只保留最近 {MAX_SAMPLES} 个点</b>——长时间运行也不会变卡。
+        注意输入与输出之间会有<b>固有延迟</b>≈ warmup + duration
         毫秒，所以输出永远会"晚一拍"——这正是真正的脉冲神经元在做物理推理的标志。
       </div>
     </div>
