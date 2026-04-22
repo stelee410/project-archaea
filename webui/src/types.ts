@@ -1,5 +1,8 @@
 export type BudgetMode = "none" | "shared";
 
+// SPEC_L2_V2.0 — evolution task selector
+export type SimTask = "l1" | "l2v2_ctrl";
+
 export interface SimConfig {
   seed: number;
   pop_max: number;
@@ -21,6 +24,20 @@ export interface SimConfig {
   migrate_prob: number;
   calibration_lambda: number;
   synapse_gain: number;
+  task: SimTask;
+}
+
+// SPEC_L2_V2.0 §2.2 — one window's stimulus + ground truth
+export interface OracleSnapshot {
+  mode: 0 | 1;            // 0 = AND, 1 = NOT
+  mode_name: "AND" | "NOT";
+  bit_a: 0 | 1;
+  bit_b: 0 | 1;
+  f_a_hz: number;
+  f_b_hz: number;
+  f_s_hz: number;
+  target_bit: 0 | 1;
+  reward_correct: number;
 }
 
 export interface TelemetryEvent {
@@ -51,7 +68,20 @@ export interface TelemetryEvent {
   pheromone_max: number;
   pheromone_mean: number;
   hgt_count: number;
+  hgt_pairs?: [number, number][];
   migrations: number;
+  // Per-slot reward this window (length pop_max). 0 for non-alive / no reward.
+  reward?: number[];
+  credit_delta?: number[];
+  // SPEC_L2_V2.0 (only meaningful when task = "l2v2_ctrl")
+  task?: SimTask;
+  oracle?: OracleSnapshot | null;
+  consensus_bit?: 0 | 1 | null;
+  consensus_acc?: number;
+  acc_and_pop?: number;
+  acc_not_pop?: number;
+  both_pass_pct?: number;
+  logic_diversity?: number;
 }
 
 export interface HelloEvent {
@@ -84,6 +114,9 @@ export interface InferenceRequest {
   duration_ms: number;
   warmup_ms: number;
   swarm_radius?: number;
+  // SPEC_L2_V2.0 — optional second / selector channels.
+  f_b_hz?: number;
+  f_s_hz?: number;
 }
 
 export interface InferenceAgentResult {
@@ -98,6 +131,9 @@ export interface InferenceResponseExtras {
 
 export interface InferenceResponse extends InferenceResponseExtras {
   f_in_hz: number;
+  f_b_hz?: number | null;
+  f_s_hz?: number | null;
+  task?: SimTask;
   f_out_hz: number;
   target: string;
   duration_ms: number;

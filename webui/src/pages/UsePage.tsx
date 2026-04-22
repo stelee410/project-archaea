@@ -15,6 +15,7 @@ import { api } from "../api";
 import { useStore } from "../store";
 import { usePersistentState } from "../hooks/usePersistentState";
 import { LiveTrackCard } from "../components/LiveTrackCard";
+import { LogicTester } from "../components/LogicTester";
 import type { InferenceResponse, SweepResponse } from "../types";
 
 interface InteractionRow {
@@ -96,6 +97,7 @@ function buildSequence(form: SweepFormState): number[] {
 
 export function UsePage() {
   const status = useStore((s) => s.status);
+  const isL2v2 = status?.config?.task === "l2v2_ctrl";
 
   const [form, setForm] = usePersistentState<UseFormState>(
     "use-form",
@@ -225,8 +227,28 @@ export function UsePage() {
   return (
     <div className="max-w-[1300px] mx-auto p-6 grid gap-6 grid-cols-12">
       <section className="col-span-12 lg:col-span-7 space-y-5">
+        {isL2v2 && (
+          <LogicTester
+            target={target}
+            topK={topK}
+            swarmRadius={swarmRadius}
+            durationMs={durationMs}
+            warmupMs={warmupMs}
+          />
+        )}
         <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-5">
-          <h2 className="text-base font-semibold mb-3">查询种群</h2>
+          <h2 className="text-base font-semibold mb-1">
+            {isL2v2 ? "🔬 底层接口：直接喂 Hz (高级 / 调试用)" : "查询种群"}
+          </h2>
+          {isL2v2 ? (
+            <p className="text-[11px] text-slate-400 mb-3 leading-relaxed">
+              这是 L1 时代的「单通道频率输入」接口。L2v2 任务下推荐用上方的「逻辑题」面板，
+              它会自动按 SPEC §2 把 0/1 翻译成三通道电平。这里仅用于手动探针：
+              改 f_in_hz 时 Channel B 默认 0 Hz、Channel S 默认 AND 指令 (20 Hz)。
+            </p>
+          ) : (
+            <div className="mb-2" />
+          )}
           <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
             <Field label="输入发放率 f_in (Hz)" hint="10 个独立 Poisson 通道，同一速率">
               <input

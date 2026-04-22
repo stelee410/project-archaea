@@ -5,7 +5,7 @@ import { useStore } from "../store";
 import { usePersistentState } from "../hooks/usePersistentState";
 import { CALIBRATION_LAMBDA_STORAGE_KEY } from "../components/CalibrationLambdaSlider";
 import { SYNAPSE_GAIN_STORAGE_KEY } from "../components/SynapseGainSlider";
-import type { BudgetMode, SimConfig } from "../types";
+import type { BudgetMode, SimConfig, SimTask } from "../types";
 
 interface FieldDoc {
   key: keyof SimConfig;
@@ -17,6 +17,16 @@ interface FieldDoc {
 }
 
 const FIELDS: FieldDoc[] = [
+  {
+    key: "task",
+    label: "演化任务 task",
+    desc: "L1 = 频率跟随（SPEC §3.1）；L2v2 = 三通道逻辑门控（SPEC_L2_V2.0）。",
+    detail:
+      "L1：单通道 f_in，目标 f_out 跟随 f_in，奖励=Pearson r。\n" +
+      "L2v2_ctrl：A(4)+B(4)+S(2) 三通道，S 频率决定指令——20Hz=AND、80Hz=NOT。Oracle 按真值表发奖励：AND(1,1)→+5、NOT(0,*)→+12.5（高难溢价）。" +
+      "权重初始化 ∈ [-1.5, 1.5]（允许抑制突触）。",
+    defaultValue: "l1",
+  },
   {
     key: "seed",
     label: "随机种子 seed",
@@ -108,6 +118,7 @@ export function SetupPage({ onLaunched }: { onLaunched: () => void }) {
     migrate_prob: 0.3,
     calibration_lambda: 0.0,
     synapse_gain: 1.0,
+    task: "l1",
   });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -287,7 +298,16 @@ function FieldRow({
       </div>
       <p className="text-xs text-slate-400 mt-1">{field.desc}</p>
       <div className="mt-2">
-        {field.key === "budget_mode" ? (
+        {field.key === "task" ? (
+          <select
+            value={value as string}
+            onChange={(e) => onChange(e.target.value as SimTask)}
+            className="w-full bg-slate-950 border border-slate-700 rounded px-2 py-1.5 text-sm font-mono"
+          >
+            <option value="l1">l1 — 频率跟随 (SPEC §3.1)</option>
+            <option value="l2v2_ctrl">l2v2_ctrl — 逻辑门控 (SPEC_L2_V2.0)</option>
+          </select>
+        ) : field.key === "budget_mode" ? (
           <select
             value={value as string}
             onChange={(e) => onChange(e.target.value as BudgetMode)}

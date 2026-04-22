@@ -10,6 +10,9 @@ interface Props {
 
 const C_REPRO = 200; // SPEC §4.2
 
+// SPEC_L2_V2.0 §4.2 — agents below this Credit fade red ("hunger warning").
+const HUNGER_CREDIT = 20;
+
 function dotColor(alive: boolean, credit: number): string {
   if (!alive) return "#374151";
   if (credit < 15) return "#dc2626";
@@ -22,6 +25,13 @@ function dotColor(alive: boolean, credit: number): string {
   return "#f97316";
 }
 
+// Hunger fade: agents with low credit get drawn at reduced alpha.
+// 0.0 (invisible) → 1.0 (full opacity).
+function hungerAlpha(credit: number): number {
+  if (credit >= HUNGER_CREDIT) return 1.0;
+  return Math.max(0.25, credit / HUNGER_CREDIT);
+}
+
 export function DotGrid({ ev, popMax, selectedSlot, onSelect }: Props) {
   const ref = useRef<HTMLCanvasElement | null>(null);
   const slimeMode = !!(ev?.slime_enabled && ev?.grid_size > 0);
@@ -31,6 +41,19 @@ export function DotGrid({ ev, popMax, selectedSlot, onSelect }: Props) {
   const eventChildren = useMemo(() => new Set(ev?.repro_child_slots ?? []), [ev]);
   const eventParents = useMemo(() => new Set(ev?.repro_parent_slots ?? []), [ev]);
   const eventDeads = useMemo(() => new Set(ev?.dead_slots ?? []), [ev]);
+  // SPEC_L2_V2.0 §4.2 — slots that received non-trivial reward this window.
+  // These flash gold in the next paint.
+  const goldenSlots = useMemo(() => {
+    const r = ev?.reward;
+    if (!r) return new Set<number>();
+    // Threshold: any positive reward this window counts as "earned" → flash.
+    const out = new Set<number>();
+    for (let i = 0; i < r.length; i++) {
+      if (r[i] > 0.5) out.add(i);
+    }
+    return out;
+  }, [ev]);
+  const hgtPairs = useMemo(() => ev?.hgt_pairs ?? [], [ev]);
 
   useEffect(() => {
     const cv = ref.current;
@@ -43,20 +66,19 @@ export function DotGrid({ ev, popMax, selectedSlot, onSelect }: Props) {
     ctx.fillStyle = "#0f172a";
     ctx.fillRect(0, 0, W, H);
 
+    const sets: OverlaySets = {
+      children: eventChildren,
+      parents: eventParents,
+      deads: eventDeads,
+      golden: goldenSlots,
+      hgtPairs,
+    };
     if (slimeMode && ev) {
-      drawSpatial(ctx, W, H, ev, selectedSlot, {
-        children: eventChildren,
-        parents: eventParents,
-        deads: eventDeads,
-      });
+      drawSpatial(ctx, W, H, ev, selectedSlot, sets);
     } else {
-      drawSlotGrid(ctx, W, H, ev, popMax, cols, rows, selectedSlot, {
-        children: eventChildren,
-        parents: eventParents,
-        deads: eventDeads,
-      });
+      drawSlotGrid(ctx, W, H, ev, popMax, cols, rows, selectedSlot, sets);
     }
-  }, [ev, popMax, cols, rows, selectedSlot, eventChildren, eventParents, eventDeads, slimeMode]);
+  }, [ev, popMax, cols, rows, selectedSlot, eventChildren, eventParents, eventDeads, slimeMode, goldenSlots, hgtPairs]);
 
   function handleClick(e: React.MouseEvent<HTMLCanvasElement>) {
     const cv = ref.current;
@@ -130,9 +152,11 @@ export function DotGrid({ ev, popMax, selectedSlot, onSelect }: Props) {
           <Legend dot="#eab308" label="中 Credit" />
           <Legend dot="#f97316" label="低 Credit" />
           <Legend dot="#dc2626" label="临界" />
-          <Legend dot="#ec4899" label="新生 (粉描边)" />
-          <Legend dot="#f9a8d4" label="亲代 (浅粉描边)" />
-          <Legend dot="#94a3b8" label="饿死 (灰描边)" />
+          <Legend dot="#fbbf24" label="✨ 获奖闪烁 (L2v2)" />
+          <Legend dot="#ec4899" label="新生" />
+          <Legend dot="#f9a8d4" label="亲代" />
+          <Legend dot="#94a3b8" label="饿死" />
+          <Legend dot="#a855f7" label="HGT 连线" />
           <span className="ml-auto text-slate-500">点击 dot → 右侧查看 agent 内部 10→20→1 拓扑</span>
         </div>
       )}
@@ -144,6 +168,10 @@ interface OverlaySets {
   children: Set<number>;
   parents: Set<number>;
   deads: Set<number>;
+  // SPEC_L2_V2.0 §4.2 — slots that earned reward this window (flash gold)
+  golden: Set<number>;
+  // SPEC_L2_V2.0 §4.2 — [recipient_slot, donor_slot] pairs for HGT social lines
+  hgtPairs: [number, number][];
 }
 
 function drawSlotGrid(
@@ -162,15 +190,26 @@ function drawSlotGrid(
   const dyAvail = (H - pad * 2) / rows;
   const r = Math.max(2.5, Math.min(dxAvail, dyAvail) * 0.42);
 
+  // Pre-compute slot centres so HGT lines can reference them.
+  const centres: { x: number; y: number }[] = [];
   for (let s = 0; s < popMax; s++) {
-    const cx = pad + (s % cols + 0.5) * dxAvail;
-    const cy = pad + (Math.floor(s / cols) + 0.5) * dyAvail;
+    centres.push({
+      x: pad + ((s % cols) + 0.5) * dxAvail,
+      y: pad + (Math.floor(s / cols) + 0.5) * dyAvail,
+    });
+  }
+
+  for (let s = 0; s < popMax; s++) {
+    const { x: cx, y: cy } = centres[s];
     const alive = ev ? !!ev.alive[s] : false;
     const credit = ev ? ev.credit[s] : 0;
+    const alpha = alive ? hungerAlpha(credit) : 1.0;
+    ctx.globalAlpha = alpha;
     ctx.beginPath();
     ctx.arc(cx, cy, r, 0, Math.PI * 2);
     ctx.fillStyle = dotColor(alive, credit);
     ctx.fill();
+    ctx.globalAlpha = 1.0;
     drawOverlay(ctx, cx, cy, r, s, sets);
     if (selectedSlot === s) {
       ctx.beginPath();
@@ -180,6 +219,8 @@ function drawSlotGrid(
       ctx.stroke();
     }
   }
+
+  drawHgtLines(ctx, sets.hgtPairs, centres);
 }
 
 function drawSpatial(
@@ -228,6 +269,8 @@ function drawSpatial(
   }
 
   const r = Math.max(2.5, Math.min(cellW, cellH) * 0.28);
+  // Per-agent screen positions (needed for HGT lines below).
+  const slotXY = new Map<number, { x: number; y: number }>();
   for (let s = 0; s < ev.alive.length; s++) {
     if (!ev.alive[s]) continue;
     const [px, py] = ev.positions[s] ?? [0, 0];
@@ -243,10 +286,14 @@ function drawSpatial(
       cx += Math.cos(angle) * radius;
       cy += Math.sin(angle) * radius;
     }
+    slotXY.set(s, { x: cx, y: cy });
+    const alpha = hungerAlpha(ev.credit[s]);
+    ctx.globalAlpha = alpha;
     ctx.beginPath();
     ctx.arc(cx, cy, r, 0, Math.PI * 2);
     ctx.fillStyle = dotColor(true, ev.credit[s]);
     ctx.fill();
+    ctx.globalAlpha = 1.0;
     drawOverlay(ctx, cx, cy, r, s, sets);
     if (selectedSlot === s) {
       ctx.beginPath();
@@ -256,6 +303,44 @@ function drawSpatial(
       ctx.stroke();
     }
   }
+
+  // HGT social lines — only between two living agents we actually drew.
+  ctx.save();
+  ctx.strokeStyle = "rgba(168, 85, 247, 0.65)";
+  ctx.lineWidth = 1.4;
+  ctx.setLineDash([4, 3]);
+  for (const [recipient, donor] of sets.hgtPairs) {
+    const a = slotXY.get(recipient);
+    const b = slotXY.get(donor);
+    if (!a || !b) continue;
+    ctx.beginPath();
+    ctx.moveTo(a.x, a.y);
+    ctx.lineTo(b.x, b.y);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawHgtLines(
+  ctx: CanvasRenderingContext2D,
+  pairs: [number, number][],
+  centres: { x: number; y: number }[]
+) {
+  if (pairs.length === 0) return;
+  ctx.save();
+  ctx.strokeStyle = "rgba(168, 85, 247, 0.6)";
+  ctx.lineWidth = 1.2;
+  ctx.setLineDash([4, 3]);
+  for (const [recipient, donor] of pairs) {
+    const a = centres[recipient];
+    const b = centres[donor];
+    if (!a || !b) continue;
+    ctx.beginPath();
+    ctx.moveTo(a.x, a.y);
+    ctx.lineTo(b.x, b.y);
+    ctx.stroke();
+  }
+  ctx.restore();
 }
 
 function drawOverlay(
@@ -266,6 +351,24 @@ function drawOverlay(
   s: number,
   sets: OverlaySets
 ) {
+  // SPEC_L2_V2.0 §4.2 — gold halo for agents earning Credit this window.
+  if (sets.golden.has(s)) {
+    ctx.save();
+    const grd = ctx.createRadialGradient(cx, cy, r * 0.6, cx, cy, r * 2.2);
+    grd.addColorStop(0, "rgba(251, 191, 36, 0.85)");
+    grd.addColorStop(0.5, "rgba(251, 191, 36, 0.35)");
+    grd.addColorStop(1, "rgba(251, 191, 36, 0)");
+    ctx.fillStyle = grd;
+    ctx.beginPath();
+    ctx.arc(cx, cy, r * 2.2, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = "rgba(252, 211, 77, 0.95)";
+    ctx.lineWidth = 1.6;
+    ctx.beginPath();
+    ctx.arc(cx, cy, r + 1.2, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.restore();
+  }
   if (sets.children.has(s)) {
     ctx.strokeStyle = "#ec4899";
     ctx.lineWidth = 2;

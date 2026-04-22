@@ -13,6 +13,14 @@ export interface ChartPoint {
   budget: number;
   births: number;
   deaths: number;
+  // Aggregate "vitality" = pop * credit_mean (sum of all live Credit, ECG-style)
+  vitality: number;
+  // L2v2 — undefined / 0 in L1 runs
+  acc_and?: number;
+  acc_not?: number;
+  both_pass_pct?: number;
+  logic_diversity?: number;
+  consensus_acc?: number;
 }
 
 interface State {
@@ -21,6 +29,9 @@ interface State {
   status: SimStatus | null;
   latest: TelemetryEvent | null;
   history: ChartPoint[];
+  // L2v2 cumulative survival counter (since current run started)
+  totalBorn: number;
+  totalDied: number;
 
   setStatus: (s: SimStatus) => void;
   ingest: (ev: ServerEvent) => void;
@@ -34,10 +45,12 @@ export const useStore = create<State>((set) => ({
   status: null,
   latest: null,
   history: [],
+  totalBorn: 0,
+  totalDied: 0,
 
   setStatus: (s) => set({ status: s }),
   setWs: (ws, wsState) => set({ ws, wsState }),
-  resetHistory: () => set({ history: [], latest: null }),
+  resetHistory: () => set({ history: [], latest: null, totalBorn: 0, totalDied: 0 }),
 
   ingest: (ev) =>
     set((st) => {
@@ -48,6 +61,7 @@ export const useStore = create<State>((set) => ({
         return {};
       }
       const t = ev.t_sim;
+      const vitality = ev.pop_size * ev.credit_mean;
       const point: ChartPoint = {
         t,
         r_max: ev.r_max,
@@ -58,10 +72,21 @@ export const useStore = create<State>((set) => ({
         budget: ev.budget_pressure,
         births: ev.births,
         deaths: ev.deaths,
+        vitality,
+        acc_and: ev.acc_and_pop,
+        acc_not: ev.acc_not_pop,
+        both_pass_pct: ev.both_pass_pct,
+        logic_diversity: ev.logic_diversity,
+        consensus_acc: ev.consensus_acc,
       };
       const next = st.history.length >= HISTORY_LIMIT
         ? [...st.history.slice(st.history.length - HISTORY_LIMIT + 1), point]
         : [...st.history, point];
-      return { latest: ev, history: next };
+      return {
+        latest: ev,
+        history: next,
+        totalBorn: st.totalBorn + ev.births,
+        totalDied: st.totalDied + ev.deaths,
+      };
     }),
 }));

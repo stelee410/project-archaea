@@ -58,6 +58,8 @@ class SimConfigBody(BaseModel):
     calibration_lambda: float = Field(0.0, ge=0.0, le=5.0)
     # SPEC v1.2 (off-SPEC) output-layer synaptic gain g
     synapse_gain: float = Field(1.0, gt=0.0, le=20.0)
+    # SPEC_L2_V2.0 — evolution task
+    task: Literal["l1", "l2v2_ctrl"] = "l1"
 
 
 class InferenceBody(BaseModel):
@@ -67,6 +69,10 @@ class InferenceBody(BaseModel):
     duration_ms: float = Field(500.0, ge=10.0, le=5000.0)
     warmup_ms: float = Field(100.0, ge=0.0, le=2000.0)
     swarm_radius: int = Field(1, ge=1, le=8)
+    # SPEC_L2_V2.0 — optional second / selector channels.  When omitted on an
+    # L2v2 sim, the runtime defaults f_b = f_in and f_s = AND instruction.
+    f_b_hz: float | None = Field(None, ge=0.0, le=1000.0)
+    f_s_hz: float | None = Field(None, ge=0.0, le=1000.0)
 
 
 class SweepBody(BaseModel):
@@ -153,6 +159,7 @@ async def api_start(body: SimConfigBody) -> dict[str, Any]:
         migrate_prob=body.migrate_prob,
         calibration_lambda=body.calibration_lambda,
         synapse_gain=body.synapse_gain,
+        task=body.task,
     )
     try:
         return get_runtime().start(cfg)
@@ -179,6 +186,8 @@ async def api_inference(body: InferenceBody) -> dict[str, Any]:
             body.duration_ms,
             body.warmup_ms,
             body.swarm_radius,
+            body.f_b_hz,
+            body.f_s_hz,
         )
     except RuntimeError as e:
         raise HTTPException(status_code=409, detail=str(e))

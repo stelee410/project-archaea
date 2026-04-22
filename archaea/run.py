@@ -14,6 +14,7 @@ from . import telemetry
 from .champions import save_champions
 from .population import Population
 from .slime import SlimeConfig
+from .task import DEFAULT_TASK, VALID_TASKS
 from .telemetry import (
     StdoutRollingTable,
     dump_t2h_top10_csv,
@@ -49,6 +50,7 @@ def run_experiment(
     slime: SlimeConfig | None = None,
     calibration_lambda: float = 0.0,
     synapse_gain: float = 1.0,
+    task: str = DEFAULT_TASK,
 ) -> int:
     """
     Returns process exit code: 0 on success halt, 1 on failure/pathology.
@@ -64,6 +66,7 @@ def run_experiment(
         slime=slime,
         calibration_lambda=calibration_lambda,
         synapse_gain=synapse_gain,
+        task=task,
     )
 
     if visual:
@@ -331,6 +334,18 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     p.add_argument(
+        "--task",
+        type=str,
+        default=DEFAULT_TASK,
+        choices=list(VALID_TASKS),
+        help=(
+            "Evolution task. 'l1' = SPEC §3.1 single-channel rate tracking. "
+            "'l2v2_ctrl' = SPEC_L2_V2.0 logic gating with three-channel input "
+            "(A=4 data, B=4 data, S=2 selector @ 20Hz=AND / 80Hz=NOT) and "
+            "instruction-conditioned reward table."
+        ),
+    )
+    p.add_argument(
         "--synapse-gain",
         type=float,
         default=1.0,
@@ -373,6 +388,7 @@ def main(argv: list[str] | None = None) -> int:
         slime=slime_cfg,
         calibration_lambda=float(args.calibration_lambda),
         synapse_gain=float(args.synapse_gain),
+        task=str(args.task),
     )
 
 

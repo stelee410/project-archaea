@@ -21,9 +21,18 @@ import numpy as np
 
 from .economy import BUDGET_MODE_NONE, R_MAX
 from .neuron import N_INPUT, NetworkBatch, NetworkSingle, unpack_weights
+from .oracle import (
+    MODE_AND,
+    MODE_NAMES,
+    MODE_NOT,
+    S_AND_HZ,
+    S_NOT_HZ,
+    poisson_three_channels,
+)
 from .population import Population
 from .slime import SlimeConfig
 from .stimulus import poisson_spikes_window
+from .task import DEFAULT_TASK, TASK_L1, TASK_L2V2, validate_task
 
 WINDOW_S = 0.5
 
@@ -58,6 +67,8 @@ class SimConfig:
     # 1.0 = SPEC §1.1 bit-identical. > 1 multiplies I_o, raising raw f_out by
     # making the output neuron physically spike more (within the LIF refractory limit).
     synapse_gain: float = 1.0
+    # SPEC_L2_V2.0 — evolution task (L1 rate tracking vs L2v2 logic gating).
+    task: str = DEFAULT_TASK
 
     def normalized(self) -> "SimConfig":
         return SimConfig(
@@ -80,6 +91,7 @@ class SimConfig:
             migrate_prob=float(self.migrate_prob),
             calibration_lambda=float(max(0.0, self.calibration_lambda)),
             synapse_gain=float(max(1e-3, self.synapse_gain)),
+            task=validate_task(self.task),
         )
 
     def to_slime_config(self) -> SlimeConfig:
@@ -206,6 +218,7 @@ class SimulationRuntime:
                 slime=cfg.to_slime_config(),
                 calibration_lambda=cfg.calibration_lambda,
                 synapse_gain=cfg.synapse_gain,
+                task=cfg.task,
             )
             self._t_sim = 0.0
             self._last_event = None
@@ -287,6 +300,8 @@ class SimulationRuntime:
         duration_ms: float = 500.0,
         warmup_ms: float = 100.0,
         swarm_radius: int = 1,
+        f_b_hz: float | None = None,
+        f_s_hz: float | None = None,
     ) -> dict[str, Any]:
         """Run inference on the chosen agent(s). Returns mean output Hz + per-agent details.
 
@@ -328,23 +343,47 @@ class SimulationRuntime:
                 else:
                     fitness_per.append(float("nan"))
             inference_gain = float(pop.synapse_gain)
+            current_task = str(pop.task)
 
         # Heavy work outside the lock.
         f_in = float(max(0.0, f_in_hz))
+        # L2v2 routing: when caller passes f_b / f_s (or task is L2v2 even with
+        # only f_in given) we drive the network with three independent channels.
+        # When neither is given AND task is L1, behaviour is bit-identical to
+        # the SPEC §3 single-channel input (test compatibility).
+        use_three_channels = (
+            current_task == TASK_L2V2
+            or f_b_hz is not None
+            or f_s_hz is not None
+        )
+        f_b = float(max(0.0, f_b_hz)) if f_b_hz is not None else f_in
+        # Default S to AND instruction frequency if caller didn't pick one.
+        f_s = float(max(0.0, f_s_hz)) if f_s_hz is not None else float(S_AND_HZ)
+
         outputs: list[float] = []
         for w in weights_per:
             net = NetworkSingle(
                 w, rng=np.random.default_rng(), output_gain=inference_gain
             )
             if warmup_ms > 0:
-                warmup_spikes = poisson_spikes_window(
-                    self._inference_rng, f_in, float(warmup_ms), N_INPUT
-                )
+                if use_three_channels:
+                    warmup_spikes = poisson_three_channels(
+                        self._inference_rng, f_in, f_b, f_s, float(warmup_ms)
+                    )
+                else:
+                    warmup_spikes = poisson_spikes_window(
+                        self._inference_rng, f_in, float(warmup_ms), N_INPUT
+                    )
                 for t in range(warmup_spikes.shape[0]):
                     net.step(warmup_spikes[t])
-            spikes = poisson_spikes_window(
-                self._inference_rng, f_in, float(duration_ms), N_INPUT
-            )
+            if use_three_channels:
+                spikes = poisson_three_channels(
+                    self._inference_rng, f_in, f_b, f_s, float(duration_ms)
+                )
+            else:
+                spikes = poisson_spikes_window(
+                    self._inference_rng, f_in, float(duration_ms), N_INPUT
+                )
             cnt = 0
             for t in range(spikes.shape[0]):
                 if net.step(spikes[t]) > 0.0:
@@ -354,6 +393,9 @@ class SimulationRuntime:
         f_out_mean = float(np.mean(outputs)) if outputs else 0.0
         return {
             "f_in_hz": f_in,
+            "f_b_hz": (f_b if use_three_channels else None),
+            "f_s_hz": (f_s if use_three_channels else None),
+            "task": current_task,
             "f_out_hz": f_out_mean,
             "target": target,
             "duration_ms": duration_ms,
@@ -697,6 +739,10 @@ class SimulationRuntime:
                         positions_list = []
                         pheromone_grid = []
                         grid_size = 0
+                    # Per-slot reward this window (length pop_max, 0.0 for non-alive)
+                    reward_list = self._pop._last_reward.tolist()
+                    credit_delta_list = self._pop._last_credit_delta.tolist()
+                    hgt_pairs_list = list(info.get("hgt_pairs", []))
                     event: dict[str, Any] = {
                         "type": "telemetry",
                         "t_sim": float(self._t_sim),
@@ -714,6 +760,8 @@ class SimulationRuntime:
                         "alive": alive_list,
                         "credit": credit_list,
                         "fitness": fitness_list,
+                        "reward": reward_list,
+                        "credit_delta": credit_delta_list,
                         "dead_slots": info["dead_slots"].tolist(),
                         "repro_parent_slots": info["repro_parent_slots"].tolist(),
                         "repro_child_slots": info["repro_child_slots"].tolist(),
@@ -724,7 +772,19 @@ class SimulationRuntime:
                         "pheromone_max": float(info.get("pheromone_max", 0.0)),
                         "pheromone_mean": float(info.get("pheromone_mean", 0.0)),
                         "hgt_count": int(info.get("hgt_count", 0)),
+                        "hgt_pairs": [
+                            [int(r), int(d)] for r, d in hgt_pairs_list
+                        ],
                         "migrations": int(info.get("migrations", 0)),
+                        # SPEC_L2_V2.0 telemetry (None / zeros for L1)
+                        "task": str(info.get("task", TASK_L1)),
+                        "oracle": info.get("oracle"),
+                        "consensus_bit": info.get("consensus_bit"),
+                        "consensus_acc": float(info.get("consensus_acc", 0.0)),
+                        "acc_and_pop": float(info.get("acc_and_pop", 0.0)),
+                        "acc_not_pop": float(info.get("acc_not_pop", 0.0)),
+                        "both_pass_pct": float(info.get("both_pass_pct", 0.0)),
+                        "logic_diversity": float(info.get("logic_diversity", 0.0)),
                     }
                     self._last_event = event
                     subs = list(self._subscribers)
