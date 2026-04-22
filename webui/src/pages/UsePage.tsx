@@ -15,7 +15,7 @@ import { api } from "../api";
 import { useStore } from "../store";
 import { usePersistentState } from "../hooks/usePersistentState";
 import { LiveTrackCard } from "../components/LiveTrackCard";
-import { LogicTester } from "../components/LogicTester";
+import type { ColonyMeta } from "../colonies/registry";
 import type { InferenceResponse, SweepResponse } from "../types";
 
 interface InteractionRow {
@@ -95,9 +95,15 @@ function buildSequence(form: SweepFormState): number[] {
   });
 }
 
-export function UsePage() {
+interface UsePageProps {
+  colony: ColonyMeta;
+}
+
+export function UsePage({ colony }: UsePageProps) {
   const status = useStore((s) => s.status);
-  const isL2v2 = status?.config?.task === "l2v2_ctrl";
+  const ColonyUseExtras = colony.UseExtras;
+  const demoteLegacy = !!colony.demoteLegacyUseInput;
+  const hideLegacy = !!colony.hideLegacyUseTools;
 
   const [form, setForm] = usePersistentState<UseFormState>(
     "use-form",
@@ -224,27 +230,23 @@ export function UsePage() {
     );
   }
 
-  return (
-    <div className="max-w-[1300px] mx-auto p-6 grid gap-6 grid-cols-12">
-      <section className="col-span-12 lg:col-span-7 space-y-5">
-        {isL2v2 && (
-          <LogicTester
-            target={target}
-            topK={topK}
-            swarmRadius={swarmRadius}
-            durationMs={durationMs}
-            warmupMs={warmupMs}
-          />
-        )}
-        <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-5">
+  // L2v2（demoteLegacy）下，下面 4 块 L1 频率工具与本任务都无关：
+  //   - 底层接口（直接喂 Hz）  : 上方 LogicTester 已能按 SPEC 翻译成多通道电平
+  //   - 打分（手动 ±Credit）   : Oracle 真值表已自动评分，手动会扰乱演化方向
+  //   - 实时跟随（鼠标驱动）   : 频率跟随的可视化，逻辑题没有"跟随"概念
+  //   - Sweep 测试（扫频图）   : 逻辑题输出只关心 bit (>50Hz)，扫频曲线无意义
+  // 但保留它们便于偶尔做底层探针 → 整体打包成默认折叠的 <details>。
+  const legacyTools = (
+    <>
+      <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-5">
           <h2 className="text-base font-semibold mb-1">
-            {isL2v2 ? "🔬 底层接口：直接喂 Hz (高级 / 调试用)" : "查询种群"}
+            {demoteLegacy ? "🔬 底层接口：直接喂 Hz (高级 / 调试用)" : "查询种群"}
           </h2>
-          {isL2v2 ? (
+          {demoteLegacy ? (
             <p className="text-[11px] text-slate-400 mb-3 leading-relaxed">
-              这是 L1 时代的「单通道频率输入」接口。L2v2 任务下推荐用上方的「逻辑题」面板，
-              它会自动按 SPEC §2 把 0/1 翻译成三通道电平。这里仅用于手动探针：
-              改 f_in_hz 时 Channel B 默认 0 Hz、Channel S 默认 AND 指令 (20 Hz)。
+              这是 L1 时代的「单通道频率输入」接口。当前群落（{colony.emoji} {colony.name}）
+              推荐用上方的任务专属面板，它会按 SPEC 自动把语义化输入翻译成多通道电平。
+              这里仅用于手动探针：改 f_in_hz 时其他通道走默认值。
             </p>
           ) : (
             <div className="mb-2" />
@@ -400,30 +402,39 @@ export function UsePage() {
               />
             </Field>
           </div>
-          <div className="flex gap-3">
-            <button
-              disabled={!latest || busy}
-              onClick={() => judge("correct")}
-              className={clsx(
-                "flex-1 px-4 py-2.5 rounded-md font-medium",
-                "bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-200 ring-1 ring-emerald-500/40",
-                "disabled:opacity-40"
-              )}
-            >
-              ✓ 正确（+{Math.abs(creditCorrect)} Credit）
-            </button>
-            <button
-              disabled={!latest || busy}
-              onClick={() => judge("wrong")}
-              className={clsx(
-                "flex-1 px-4 py-2.5 rounded-md font-medium",
-                "bg-rose-500/20 hover:bg-rose-500/30 text-rose-200 ring-1 ring-rose-500/40",
-                "disabled:opacity-40"
-              )}
-            >
-              ✗ 错误（−{Math.abs(creditWrong)} Credit）
-            </button>
-          </div>
+          {demoteLegacy ? (
+            <div className="px-3 py-2 rounded bg-slate-950/60 border border-slate-700/60 text-xs text-slate-400 leading-relaxed">
+              ⓘ 当前群落（{colony.emoji} {colony.name}）已有 <b className="text-slate-200">Oracle 真值表自动评分</b>
+              （NOT(0)=+25 / AND(1,1)=+15 / silent正确=+0.5~1.0 Credit），手动 ±5 会和 Oracle 争夺信用分配、
+              <span className="text-rose-300">扰乱演化方向</span>，所以这里禁用。
+              如果只是想看 agent 输出对不对，用上方的「<b>问这一题</b>」面板。
+            </div>
+          ) : (
+            <div className="flex gap-3">
+              <button
+                disabled={!latest || busy}
+                onClick={() => judge("correct")}
+                className={clsx(
+                  "flex-1 px-4 py-2.5 rounded-md font-medium",
+                  "bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-200 ring-1 ring-emerald-500/40",
+                  "disabled:opacity-40"
+                )}
+              >
+                ✓ 正确（+{Math.abs(creditCorrect)} Credit）
+              </button>
+              <button
+                disabled={!latest || busy}
+                onClick={() => judge("wrong")}
+                className={clsx(
+                  "flex-1 px-4 py-2.5 rounded-md font-medium",
+                  "bg-rose-500/20 hover:bg-rose-500/30 text-rose-200 ring-1 ring-rose-500/40",
+                  "disabled:opacity-40"
+                )}
+              >
+                ✗ 错误（−{Math.abs(creditWrong)} Credit）
+              </button>
+            </div>
+          )}
         </div>
 
         <LiveTrackCard
@@ -451,9 +462,36 @@ export function UsePage() {
             <li>「Sweep 测试」会在 [f_in_min, f_in_max] 之间均匀采样若干点，逐点查询并画出 f_in→f_out 关系曲线，用红色 y=x 直线作为「完美匹配」参照。</li>
           </ol>
         </div>
+      </>
+  );
+
+  return (
+    <div className="max-w-[1300px] mx-auto p-6 grid gap-6 grid-cols-12">
+      <section className={clsx("space-y-5", hideLegacy ? "col-span-12" : "col-span-12 lg:col-span-7")}>
+        {ColonyUseExtras && <ColonyUseExtras />}
+        {hideLegacy ? null : demoteLegacy ? (
+          <details className="rounded-lg border border-slate-800 bg-slate-900/30 group">
+            <summary className="cursor-pointer px-5 py-3 text-sm text-slate-400 hover:text-slate-200 select-none flex items-center gap-2">
+              <span className="text-slate-500 group-open:rotate-90 inline-block transition-transform">▶</span>
+              🔧 L1 频率工具（与本任务无关 · 高级 / 调试用）
+              <span className="ml-auto text-[11px] text-slate-600">点击展开</span>
+            </summary>
+            <div className="px-5 pb-5 space-y-5 border-t border-slate-800">
+              <div className="pt-5 px-3 py-2 rounded bg-amber-950/20 border border-amber-700/30 text-xs text-amber-200/80 leading-relaxed">
+                ⚠️ 下面这些是 L1「频率跟随」时代的工具：单通道 Hz 输入、扫频画 f_in/f_out 曲线、
+                鼠标拖拽实时跟随。逻辑门控任务的输出只关心 bit（{">"}/{"<"} 50Hz），这些可视化对它没有意义；
+                打分按钮已禁用避免与 Oracle 自动评分冲突。仅在你想做底层探针（验证 g 是否够、看 swarm 是否在工作）时展开。
+              </div>
+              {legacyTools}
+            </div>
+          </details>
+        ) : (
+          legacyTools
+        )}
       </section>
 
-      {/* 历史 */}
+      {/* 历史（仅 L1 工具产生条目；L2v2 等隐藏 L1 工具的群落整段不渲染） */}
+      {!hideLegacy && (
       <aside className="col-span-12 lg:col-span-5">
         <div className="rounded-lg border border-slate-800 bg-slate-900/50 overflow-hidden">
           <div className="px-3 py-2 text-xs text-slate-400 border-b border-slate-800">
@@ -518,6 +556,7 @@ export function UsePage() {
           </div>
         </div>
       </aside>
+      )}
       <style>{`.num-input{display:block;width:100%;background:#020617;border:1px solid #334155;border-radius:6px;padding:6px 8px;font-family:ui-monospace,monospace;font-size:13px;color:#e2e8f0;}`}</style>
     </div>
   );

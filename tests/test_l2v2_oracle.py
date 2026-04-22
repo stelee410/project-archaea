@@ -14,6 +14,10 @@ from archaea.oracle import (
     MODE_NAMES,
     MODE_NOT,
     OUT_SPIKING_THRESHOLD_HZ,
+    R_AND_SILENT_RAW,
+    R_AND_SPIKE_RAW,
+    R_NOT_SILENT_RAW,
+    R_NOT_SPIKE_RAW,
     REWARD_SCALE,
     S_AND_HZ,
     S_JITTER_HZ,
@@ -109,8 +113,8 @@ def test_oracle_S_frequency_brackets():
             assert abs(sample.f_s_hz - S_NOT_HZ) <= S_JITTER_HZ + 1e-9
 
 
-def test_oracle_reward_table_matches_spec_ratios():
-    """SPEC §2.2 — NOT(target=1) gives the high-difficulty premium."""
+def test_oracle_reward_table_matches_rebalanced_values():
+    """ERRATA v2.1 — spike-correct rewards amplified to break silent collapse."""
     rng = np.random.default_rng(17)
     rewards = {}
     for _ in range(2000):
@@ -121,14 +125,45 @@ def test_oracle_reward_table_matches_spec_ratios():
     assert (MODE_AND, 1) in rewards
     assert (MODE_NOT, 0) in rewards
     assert (MODE_NOT, 1) in rewards
-    # ratios per SPEC table (scaled by REWARD_SCALE, ratios preserved)
-    assert rewards[(MODE_AND, 1)] == pytest.approx(20.0 * REWARD_SCALE)
-    assert rewards[(MODE_AND, 0)] == pytest.approx(5.0 * REWARD_SCALE)
-    assert rewards[(MODE_NOT, 1)] == pytest.approx(50.0 * REWARD_SCALE)
-    assert rewards[(MODE_NOT, 0)] == pytest.approx(10.0 * REWARD_SCALE)
-    # NOT(1) must dominate AND(1) and AND(0) by a wide margin (high-difficulty premium)
-    assert rewards[(MODE_NOT, 1)] > 2 * rewards[(MODE_AND, 1)]
-    assert rewards[(MODE_NOT, 1)] > 8 * rewards[(MODE_AND, 0)]
+    # exact rebalanced values (× REWARD_SCALE)
+    assert rewards[(MODE_AND, 1)] == pytest.approx(R_AND_SPIKE_RAW * REWARD_SCALE)
+    assert rewards[(MODE_AND, 0)] == pytest.approx(R_AND_SILENT_RAW * REWARD_SCALE)
+    assert rewards[(MODE_NOT, 1)] == pytest.approx(R_NOT_SPIKE_RAW * REWARD_SCALE)
+    assert rewards[(MODE_NOT, 0)] == pytest.approx(R_NOT_SILENT_RAW * REWARD_SCALE)
+    # NOT(1) must remain the highest premium (SPEC §2.2 intent preserved)
+    assert rewards[(MODE_NOT, 1)] > rewards[(MODE_AND, 1)]
+    assert rewards[(MODE_NOT, 1)] > 10 * rewards[(MODE_NOT, 0)]
+    assert rewards[(MODE_AND, 1)] > 10 * rewards[(MODE_AND, 0)]
+
+
+def test_reward_table_breaks_silent_collapse():
+    """Anti-attractor invariant: 'always silent' must be net-negative vs breath.
+
+    With BREATH_PER_WINDOW=1.25 (economy.py) and a uniform (mode, A, B) draw,
+    an agent that never spikes wins 3/4 of AND rows and 1/2 of NOT rows.
+    Its expected per-window reward must come out STRICTLY below breath, or
+    else evolution settles into the silent attractor and never learns the
+    actual logic (this is the bug ERRATA v2.1 exists to fix).
+    """
+    from archaea.economy import BREATH_PER_WINDOW
+
+    e_and_silent = R_AND_SILENT_RAW * REWARD_SCALE * (3 / 4)  # win 3/4 AND rows
+    e_not_silent = R_NOT_SILENT_RAW * REWARD_SCALE * (1 / 2)  # win 1/2 NOT rows
+    silent_per_window = 0.5 * e_and_silent + 0.5 * e_not_silent
+    assert silent_per_window < BREATH_PER_WINDOW, (
+        f"silent-strategy expected reward {silent_per_window:.3f}/window "
+        f"≥ breath {BREATH_PER_WINDOW}/window — silent collapse will dominate"
+    )
+
+    # And the perfect-logic strategy must beat it by at least an order of
+    # magnitude so the evolutionary gradient is unambiguous.
+    e_and_perfect = REWARD_SCALE * (3 / 4 * R_AND_SILENT_RAW + 1 / 4 * R_AND_SPIKE_RAW)
+    e_not_perfect = REWARD_SCALE * (1 / 2 * R_NOT_SILENT_RAW + 1 / 2 * R_NOT_SPIKE_RAW)
+    perfect_per_window = 0.5 * e_and_perfect + 0.5 * e_not_perfect
+    assert perfect_per_window > 10 * silent_per_window, (
+        f"perfect/silent ratio {perfect_per_window / silent_per_window:.1f}× "
+        "is too small — gradient may be too weak"
+    )
 
 
 # ── output classification ──────────────────────────────────────────────────

@@ -1,11 +1,16 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import clsx from "clsx";
 import { api } from "../api";
 import { useStore } from "../store";
 import { usePersistentState } from "../hooks/usePersistentState";
 import { CALIBRATION_LAMBDA_STORAGE_KEY } from "../components/CalibrationLambdaSlider";
 import { SYNAPSE_GAIN_STORAGE_KEY } from "../components/SynapseGainSlider";
-import type { BudgetMode, SimConfig, SimTask } from "../types";
+import type { ColonyMeta } from "../colonies/registry";
+import { COLONIES } from "../colonies/registry";
+import type { BudgetMode, SimConfig } from "../types";
+
+// Note: SimTask import previously used for the now-deleted `task` <select>;
+// removed because task is decided by the chosen Colony.
 
 interface FieldDoc {
   key: keyof SimConfig;
@@ -17,16 +22,6 @@ interface FieldDoc {
 }
 
 const FIELDS: FieldDoc[] = [
-  {
-    key: "task",
-    label: "演化任务 task",
-    desc: "L1 = 频率跟随（SPEC §3.1）；L2v2 = 三通道逻辑门控（SPEC_L2_V2.0）。",
-    detail:
-      "L1：单通道 f_in，目标 f_out 跟随 f_in，奖励=Pearson r。\n" +
-      "L2v2_ctrl：A(4)+B(4)+S(2) 三通道，S 频率决定指令——20Hz=AND、80Hz=NOT。Oracle 按真值表发奖励：AND(1,1)→+5、NOT(0,*)→+12.5（高难溢价）。" +
-      "权重初始化 ∈ [-1.5, 1.5]（允许抑制突触）。",
-    defaultValue: "l1",
-  },
   {
     key: "seed",
     label: "随机种子 seed",
@@ -40,8 +35,8 @@ const FIELDS: FieldDoc[] = [
     label: "种群硬上限 pop_max",
     desc: "槽位总数；繁殖装不下时按最低 Credit 替换。",
     detail:
-      "SPEC 默认 1000；WebUI 实时模式下建议 200–500，dot 太多渲染会卡。",
-    defaultValue: 200,
+      "SPEC 默认 1000。WebUI 已优化（Path2D 批量绘制 + 像素方块降级）：1000–2000 流畅，2000–5000 会自动切换为像素方块仍可读，5000+ 时主要瓶颈是 WS 带宽（每帧约 25 KB × pop_max/1000）。建议优先按生态需求选 pop_max，UI 不应是天花板。",
+    defaultValue: 1000,
   },
   {
     key: "n_initial",
@@ -93,33 +88,58 @@ const FIELDS: FieldDoc[] = [
   },
 ];
 
-export function SetupPage({ onLaunched }: { onLaunched: () => void }) {
+interface SetupPageProps {
+  colony: ColonyMeta;
+  onLaunched: () => void;
+}
+
+const BASE_DEFAULTS: SimConfig = {
+  seed: 42,
+  pop_max: 200,
+  n_initial: 100,
+  carrying_capacity: null,
+  budget_mode: "none",
+  target_speed_hz: 20,
+  slime_mold: false,
+  grid_size: 16,
+  pheromone_decay: 0.05,
+  pheromone_diffusion: 0.2,
+  pheromone_emit: 0.5,
+  pheromone_bonus_k: 0.5,
+  hgt_enabled: true,
+  hgt_prob: 0.02,
+  hgt_blend: 0.3,
+  migrate_enabled: true,
+  migrate_prob: 0.3,
+  calibration_lambda: 0.0,
+  synapse_gain: 1.0,
+  task: "l1",
+};
+
+export function SetupPage({ colony, onLaunched }: SetupPageProps) {
   const status = useStore((s) => s.status);
   const setStatus = useStore((s) => s.setStatus);
   const resetHistory = useStore((s) => s.resetHistory);
 
-  const [cfg, setCfg] = usePersistentState<SimConfig>("sim-config", {
-    seed: 42,
-    pop_max: 200,
-    n_initial: 100,
-    carrying_capacity: null,
-    budget_mode: "none",
-    target_speed_hz: 20,
-    slime_mold: false,
-    grid_size: 16,
-    pheromone_decay: 0.05,
-    pheromone_diffusion: 0.2,
-    pheromone_emit: 0.5,
-    pheromone_bonus_k: 0.5,
-    hgt_enabled: true,
-    hgt_prob: 0.02,
-    hgt_blend: 0.3,
-    migrate_enabled: true,
-    migrate_prob: 0.3,
-    calibration_lambda: 0.0,
-    synapse_gain: 1.0,
-    task: "l1",
-  });
+  // 每个群落用独立的 localStorage key — 切群落时配置互不污染
+  const storageKey = `sim-config-${colony.id}`;
+  const initialCfg: SimConfig = {
+    ...BASE_DEFAULTS,
+    ...(colony.configDefaults ?? {}),
+    task: colony.id,  // task 由群落定义，不再由用户改
+  };
+  const [cfg, setCfg] = usePersistentState<SimConfig>(storageKey, initialCfg);
+
+  // 群落切换 / 加载到旧 storage 后，强制把 task 字段对齐到当前 colony
+  // （防止 localStorage 残留旧 task 字符串）
+  const visibleFields = useMemo(
+    () =>
+      FIELDS.filter((f) => {
+        if (f.key === "calibration_lambda" && colony.hideCalibrationLambda) return false;
+        return true;
+      }),
+    [colony]
+  );
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -143,16 +163,43 @@ export function SetupPage({ onLaunched }: { onLaunched: () => void }) {
       ? "budget_mode=shared 必须填写 carrying_capacity (>0)，否则后端会拒绝启动。"
       : null;
 
+  // 后端任意时刻只能跑一个 sim。如果当前在跑的不是本 colony，
+  // 启动 = 强制替换那个群落 → 必须明确告诉用户，避免误把别的实验杀掉。
+  const runningTask = status?.running ? status.config?.task : null;
+  const runningOther = !!runningTask && runningTask !== colony.id;
+  const runningOtherColony = runningOther
+    ? COLONIES.find((c) => c.id === runningTask)
+    : null;
+  const isRestartSameColony = runningTask === colony.id;
+
   async function launch() {
     if (validationError) {
       setError(validationError);
       return;
     }
+    // 二次确认：替换别的群落 / 重启同群落 都让用户点头。
+    // 因为这两种操作都会丢失正在跑的 sim 的 in-memory 进展。
+    if (runningOther) {
+      const ok = window.confirm(
+        `当前正在跑的是「${runningOtherColony?.emoji ?? ""} ${runningOtherColony?.name ?? runningTask}」` +
+          `（t=${status?.t_sim?.toFixed(0) ?? 0}s，N=${status?.n_living ?? 0}）。\n\n` +
+          `启动「${colony.emoji} ${colony.name}」会强制结束它，演化进度将丢失。\n\n确定要替换吗？`
+      );
+      if (!ok) return;
+    } else if (isRestartSameColony) {
+      const ok = window.confirm(
+        `当前群落已经在跑（t=${status?.t_sim?.toFixed(0) ?? 0}s，N=${status?.n_living ?? 0}）。\n\n` +
+          `点「重启」会用新参数从头开始，已经演化的种群会全部消失。\n\n` +
+          `如果只是想换 g / λ，可以去「观测」页用滑块在线调，不用重启。\n\n确定要重启吗？`
+      );
+      if (!ok) return;
+    }
     setBusy(true);
     setError(null);
     try {
       resetHistory();
-      const next = await api.start(cfg);
+      // task 由当前 colony 决定，覆盖任何 localStorage 残留
+      const next = await api.start({ ...cfg, task: colony.id });
       setStatus(next);
       // Sim was just (re)started → discard the user's previous live-tuned
       // λ / g overrides so the sliders reflect the freshly-applied setup
@@ -186,10 +233,79 @@ export function SetupPage({ onLaunched }: { onLaunched: () => void }) {
 
   return (
     <div className="max-w-[1100px] mx-auto p-6">
-      <h1 className="text-xl font-semibold mb-1">设置并启动仿真</h1>
-      <p className="text-sm text-slate-400 mb-6">
+      {/* Colony intro banner */}
+      <div className="mb-6 rounded-lg border border-slate-700 bg-slate-900/60 p-5">
+        <div className="flex items-baseline gap-3 mb-2">
+          <span className="text-3xl">{colony.emoji}</span>
+          <div>
+            <h1 className="text-xl font-semibold text-slate-100">
+              {colony.name}
+            </h1>
+            <div className="text-xs text-slate-500 font-mono">
+              task = {colony.id} · {colony.specRef} · 难度{" "}
+              <span className="text-amber-300">
+                {"★".repeat(colony.difficulty)}
+                <span className="text-slate-700">
+                  {"☆".repeat(5 - colony.difficulty)}
+                </span>
+              </span>
+            </div>
+          </div>
+        </div>
+        <p className="text-sm text-slate-300 leading-relaxed whitespace-pre-line">
+          {colony.intro}
+        </p>
+      </div>
+
+      {/* 「已有别的群落在跑」的醒目警告 — 避免误启动覆盖正在做的实验 */}
+      {runningOther && runningOtherColony && (
+        <div className="mb-6 rounded-lg border-2 border-amber-500/50 bg-amber-950/30 p-4">
+          <div className="flex items-start gap-3">
+            <span className="text-2xl">⚠️</span>
+            <div className="flex-1">
+              <div className="text-sm font-semibold text-amber-200 mb-1">
+                后端正在跑另一个群落：{runningOtherColony.emoji} {runningOtherColony.name}
+              </div>
+              <div className="text-xs text-amber-100/80 leading-relaxed">
+                t_sim={status?.t_sim?.toFixed(1) ?? 0}s · N={status?.n_living ?? 0}/{status?.pop_max ?? 0}。
+                后端任意时刻只能跑一个群落 — 在这里点「替换并启动」会强制结束它，那边的演化进度将丢失。
+                如果你只是想看它跑得怎么样，
+                <button
+                  onClick={() => {
+                    // 跳到正在跑那个 colony 的 observe 页
+                    window.location.hash = ""; // 不依赖 hash router；通过自定义事件让 App 切视图
+                    window.dispatchEvent(
+                      new CustomEvent("archaea:goto-colony", {
+                        detail: { colonyId: runningOtherColony.id, tab: "observe" },
+                      })
+                    );
+                  }}
+                  className="underline text-amber-300 hover:text-amber-200 mx-1"
+                >
+                  直接去观测它
+                </button>
+                。
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+      {isRestartSameColony && (
+        <div className="mb-6 rounded-lg border border-emerald-500/40 bg-emerald-950/20 p-3 text-xs text-emerald-200/90">
+          🟢 这个群落已经在跑（t={status?.t_sim?.toFixed(1) ?? 0}s，N={status?.n_living ?? 0}）。
+          下面调任何参数后点「重启」会从头开始 —— 想看现状去
+          <span className="font-semibold mx-1 text-emerald-300">「观测」</span>
+          页；想在线调 g / λ 也在观测页（不用重启）。
+        </div>
+      )}
+
+      <h2 className="text-base font-semibold mb-1">仿真参数</h2>
+      <p className="text-sm text-slate-400 mb-4">
         修改任何参数后点击 <span className="text-emerald-300">启动 / 重启</span>。
         当前如果已有仿真在跑，会被新参数替换；客户端历史曲线随之清零。
+        <span className="text-slate-500">
+          {" "}下面的设置仅对该群落生效（独立 localStorage）。
+        </span>
       </p>
 
       {(error || validationError) && (
@@ -199,7 +315,7 @@ export function SetupPage({ onLaunched }: { onLaunched: () => void }) {
       )}
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        {FIELDS.map((f) => (
+        {visibleFields.map((f) => (
           <FieldRow
             key={f.key as string}
             field={f}
@@ -214,13 +330,26 @@ export function SetupPage({ onLaunched }: { onLaunched: () => void }) {
           disabled={busy || !!validationError}
           onClick={launch}
           className={clsx(
-            "px-5 py-2 rounded-md font-medium",
-            "bg-emerald-500 hover:bg-emerald-400 text-slate-950 transition-colors",
+            "px-5 py-2 rounded-md font-medium transition-colors",
+            runningOther
+              ? "bg-amber-500 hover:bg-amber-400 text-slate-950"
+              : "bg-emerald-500 hover:bg-emerald-400 text-slate-950",
             "disabled:opacity-40 disabled:cursor-not-allowed"
           )}
-          title={validationError ?? undefined}
+          title={
+            validationError ??
+            (runningOther
+              ? `会强制结束「${runningOtherColony?.name}」并启动当前群落`
+              : isRestartSameColony
+                ? "会从头开始（演化进度归零）"
+                : undefined)
+          }
         >
-          {status?.running ? "重启（用新参数）" : "启动"}
+          {runningOther
+            ? "替换并启动"
+            : isRestartSameColony
+              ? "重启（用新参数）"
+              : "启动"}
         </button>
         <button
           disabled={busy || !status?.running}
@@ -235,11 +364,11 @@ export function SetupPage({ onLaunched }: { onLaunched: () => void }) {
         </button>
         <button
           onClick={() => {
-            try { window.localStorage.removeItem("archaea.sim-config"); } catch { /* ignore */ }
+            try { window.localStorage.removeItem(`archaea.${storageKey}`); } catch { /* ignore */ }
             window.location.reload();
           }}
           className="px-3 py-2 rounded-md text-xs font-medium bg-slate-800/60 hover:bg-slate-700 text-slate-300"
-          title="清空浏览器中保存的设置并刷新页面"
+          title="清空该群落保存的设置并刷新页面"
         >
           重置默认
         </button>
@@ -298,16 +427,7 @@ function FieldRow({
       </div>
       <p className="text-xs text-slate-400 mt-1">{field.desc}</p>
       <div className="mt-2">
-        {field.key === "task" ? (
-          <select
-            value={value as string}
-            onChange={(e) => onChange(e.target.value as SimTask)}
-            className="w-full bg-slate-950 border border-slate-700 rounded px-2 py-1.5 text-sm font-mono"
-          >
-            <option value="l1">l1 — 频率跟随 (SPEC §3.1)</option>
-            <option value="l2v2_ctrl">l2v2_ctrl — 逻辑门控 (SPEC_L2_V2.0)</option>
-          </select>
-        ) : field.key === "budget_mode" ? (
+        {field.key === "budget_mode" ? (
           <select
             value={value as string}
             onChange={(e) => onChange(e.target.value as BudgetMode)}

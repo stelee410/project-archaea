@@ -4,22 +4,55 @@ Generates one 500 ms window's *(f_a, f_b, f_s, mode, target_bit, base_reward_tab
 All agents in the population receive the same stimulus triple per window;
 each agent is then judged independently against the truth table.
 
-Mapping from SPEC §2.2:
+──────────────────────────────────────────────────────────────────────────
+ERRATA v2.1 — Anti "silent collapse" rebalance (off-SPEC, deliberate)
+──────────────────────────────────────────────────────────────────────────
+The original SPEC §2.2 raw table (+20 / +5 / +50 / +10 — see commit
+history) suffered a class-imbalance attractor: 3 of the 4 AND truth-table
+rows want target=0 (silent), and 1 of the 2 NOT rows wants target=0.
+A trivially "always silent" agent therefore picks up:
 
-    | mode | bit_a | bit_b | target_bit | reward(correct) |
-    | AND  |   1   |   1   |    1       | +20             |
-    | AND  |   1   |   0   |    0       | +5  生存奖励     |
-    | AND  |   0   |   1   |    0       | +5              |
-    | AND  |   0   |   0   |    0       | +5              |
-    | NOT  |   1   |   *   |    0       | +10             |
-    | NOT  |   0   |   *   |    1       | +50  高难溢价   |
+    AND mode silent (3 of 4)  · 5  · 0.25 = 0.94 / window  (75% acc_AND)
+    NOT mode silent (1 of 2)  · 10 · 0.25 = 1.25 / window  (50% acc_NOT)
+                                                ─────
+    average                                     ≈ 1.09 / window
 
-The raw +20/+50/etc. table would distort the L1 economy
-(C_REPRO=200, C_INIT=50, breath=1.25/window; SPEC R_max=5/window).
-We multiply by REWARD_SCALE so the *ratios* are preserved while the
-absolute magnitudes stay inside the same order as L1 — keeping the
-"breath / reproduce in ~30 windows" rhythm that the SPEC §5 economy
-was tuned for.
+against breath = 1.25/window (economy.py).  That's a roughly break-even
+strategy that lets a never-spiking agent survive.  Worse, the population
+average displays acc_AND ≈ 75% on the dashboard, which **looks like the
+swarm has learned AND** when in fact it has learned to avoid spiking.
+
+The actual logic — `1 AND 1 → spike`, `NOT 0 → spike` — is locally costly
+to discover (needs coordinated mutations across the 220 weights including
+inhibitory paths for NOT).  Without a strong gradient pulling toward those
+two answers, mutation-only evolution settles into the silent attractor.
+
+This rebalance preserves SPEC §2.2 *intent* (NOT(0) is the high-difficulty
+premium, AND(1,1) is the only AND-spike answer) but widens the
+spike-correct vs. silent-correct gap so:
+
+    silent:    AND silent · 0.5 · 3/4  +  NOT silent · 1.0 · 1/2  = 0.44 / win
+    perfect:   AND mode  · (0.5·3/4 + 15·1/4) + NOT mode · (1·1/2 + 25·1/2)
+                                                                = 8.56 / win
+
+  → "always silent" now nets −0.81 / window (DIES in ~60 windows from
+    starting credit 50)
+  → "perfect logic" nets +7.31 / window (REPRODUCES in ~27 windows)
+  → ratio 19× (was 4.4×)
+
+Old vs. new scaled rewards:
+
+    | mode | target | OLD scaled | NEW scaled | rationale                  |
+    | AND  | 1      | 5.00       | 15.00      | 3× — break silent floor    |
+    | AND  | 0      | 1.25       | 0.50       | minimal生存, can't sustain |
+    | NOT  | 1      | 12.50      | 25.00      | 2× — keep highest premium  |
+    | NOT  | 0      | 2.50       | 1.00       | minimal生存                |
+
+REWARD_SCALE stays at 0.25 — the "raw" SPEC-style numbers below
+(R_*_RAW) are written out so the absolute economy magnitudes remain
+clear.  Tests pin the new ratios (see test_l2v2_oracle.py).
+
+──────────────────────────────────────────────────────────────────────────
 
 Interpretation note (off-SPEC clarification, see SPEC_L2_V2.0 §3.2):
   the SPEC mentions an "eligibility trace" for the hidden layer.  In
@@ -61,14 +94,21 @@ MODE_AND = 0
 MODE_NOT = 1
 MODE_NAMES = {MODE_AND: "AND", MODE_NOT: "NOT"}
 
-# ── Reward table (SPEC §2.2, scaled for L1 economy parity) ─────────────────
+# ── Reward table (rebalanced — see ERRATA v2.1 in module docstring) ────────
 #
-# To keep "breath = 1.25 / window" and "C_REPRO = 200" tuned to L1, we map:
-#   SPEC reward     · 0.25 = effective Credit increment per correct window
-# i.e. AND(1,1)=5  · AND(1,0)=1.25 · NOT(1,0)=12.5 · NOT(1,1)=2.5
-# which keeps the *ratios* (NOT(1,0) = 10× AND(1,0)) and the absolute
-# magnitudes inside [0, R_MAX × small constant].
+# Scaled values (× REWARD_SCALE) are what actually arrives at credit:
+#     AND spike  = 15.0      AND silent = 0.5
+#     NOT spike  = 25.0      NOT silent = 1.0
+#
+# Anti silent-collapse design: silent rewards (0.5 / 1.0) are intentionally
+# below BREATH_PER_WINDOW=1.25 so that "永远 silent" loses ~0.81/window and
+# starves out.  Spike rewards (15 / 25) are the only path to net-positive
+# credit, forcing evolution to discover the actual logic.
 REWARD_SCALE = 0.25
+R_AND_SPIKE_RAW = 60.0    # was 20  — 3× to overpower silent attractor on AND(1,1)
+R_AND_SILENT_RAW = 2.0    # was  5  — minimal生存奖, sub-breath
+R_NOT_SPIKE_RAW = 100.0   # was 50  — high-difficulty premium remains highest
+R_NOT_SILENT_RAW = 4.0    # was 10  — minimal生存奖, sub-breath
 
 
 @dataclass
@@ -91,12 +131,17 @@ class OracleSample:
 
 
 def _reward_correct(mode: int, target_bit: int) -> float:
-    """SPEC §2.2 Oracle Altar reward (scaled)."""
+    """Oracle Altar reward — see ERRATA v2.1 in module docstring.
+
+    Spike-correct (target_bit=1) values are amplified vs. SPEC §2.2 to
+    overpower the "always silent" attractor that emerges from the truth
+    table's class imbalance (3/4 of AND rows + 1/2 of NOT rows expect 0).
+    Silent-correct values are dropped below BREATH_PER_WINDOW so that
+    永远沉默 → 净亏 → 饿死.
+    """
     if mode == MODE_AND:
-        # AND: +20 for both-on, +5 for "silent is correct"
-        return (20.0 if target_bit == 1 else 5.0) * REWARD_SCALE
-    # NOT: +50 high-difficulty premium for spiking, +10 for silent
-    return (50.0 if target_bit == 1 else 10.0) * REWARD_SCALE
+        return (R_AND_SPIKE_RAW if target_bit == 1 else R_AND_SILENT_RAW) * REWARD_SCALE
+    return (R_NOT_SPIKE_RAW if target_bit == 1 else R_NOT_SILENT_RAW) * REWARD_SCALE
 
 
 def draw_oracle_sample(rng: np.random.Generator) -> OracleSample:

@@ -20,17 +20,40 @@ async function jget<T>(path: string): Promise<T> {
   return r.json() as Promise<T>;
 }
 
-async function jpost<T>(path: string, body: unknown): Promise<T> {
-  const r = await fetch(path, {
-    method: "POST",
-    headers: J,
-    body: JSON.stringify(body),
-  });
-  if (!r.ok) {
-    const txt = await r.text().catch(() => r.statusText);
-    throw new Error(`${r.status} ${r.statusText}: ${txt}`);
+async function jpost<T>(
+  path: string,
+  body: unknown,
+  opts?: { timeoutMs?: number }
+): Promise<T> {
+  // Default 30s — covers worst-case batched inference even with target=swarm
+  // hitting hundreds of agents. /api/start /stop are short, /api/sweep can be
+  // longer; callers can override via opts.timeoutMs.
+  const timeoutMs = opts?.timeoutMs ?? 30000;
+  const ctrl = new AbortController();
+  const tid = window.setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const r = await fetch(path, {
+      method: "POST",
+      headers: J,
+      body: JSON.stringify(body),
+      signal: ctrl.signal,
+    });
+    if (!r.ok) {
+      const txt = await r.text().catch(() => r.statusText);
+      throw new Error(`${r.status} ${r.statusText}: ${txt}`);
+    }
+    return r.json() as Promise<T>;
+  } catch (e) {
+    if ((e as DOMException)?.name === "AbortError") {
+      throw new Error(
+        `请求超时（${(timeoutMs / 1000).toFixed(0)}s）：后端可能在算大批 agent，` +
+          `或仿真线程被卡住。可以试着减小 top_k / swarm_radius，或刷新页面。`
+      );
+    }
+    throw e;
+  } finally {
+    window.clearTimeout(tid);
   }
-  return r.json() as Promise<T>;
 }
 
 export const api = {
@@ -39,7 +62,8 @@ export const api = {
   stop: () => jpost<SimStatus>("/api/stop", {}),
   inference: (req: InferenceRequest) =>
     jpost<InferenceResponse>("/api/inference", req),
-  sweep: (req: SweepRequest) => jpost<SweepResponse>("/api/sweep", req),
+  sweep: (req: SweepRequest) =>
+    jpost<SweepResponse>("/api/sweep", req, { timeoutMs: 120000 }),
   setCalibrationLambda: (calibration_lambda: number) =>
     jpost<{ calibration_lambda: number }>("/api/calibration-lambda", {
       calibration_lambda,

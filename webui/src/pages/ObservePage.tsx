@@ -5,15 +5,19 @@ import { AgentDetail } from "../components/AgentDetail";
 import { StatsTable } from "../components/StatsTable";
 import { CalibrationLambdaSlider } from "../components/CalibrationLambdaSlider";
 import { SynapseGainSlider } from "../components/SynapseGainSlider";
-import { L2Dashboard } from "../components/L2Dashboard";
 import {
   BudgetChart,
   FitnessChart,
   PopulationChart,
   VitalsChart,
 } from "../components/Charts";
+import type { ColonyMeta } from "../colonies/registry";
 
-export function ObservePage() {
+interface Props {
+  colony: ColonyMeta;
+}
+
+export function ObservePage({ colony }: Props) {
   const latest = useStore((s) => s.latest);
   const history = useStore((s) => s.history);
   const status = useStore((s) => s.status);
@@ -28,17 +32,18 @@ export function ObservePage() {
     );
   }
 
-  const isL2v2 = (latest?.task ?? status?.config?.task) === "l2v2_ctrl";
+  // 任务专属面板（如 L2v2 的 L2Dashboard）由 colony 决定
+  const Dashboard = colony.Dashboard;
 
   return (
     <div className="max-w-[1500px] mx-auto p-4 grid gap-4 grid-cols-12">
-      {isL2v2 && (
+      {Dashboard && (
         <div className="col-span-12">
-          <L2Dashboard ev={latest} />
+          <Dashboard ev={latest} />
         </div>
       )}
       <div className="col-span-12 grid grid-cols-1 xl:grid-cols-2 gap-3">
-        {!isL2v2 && (
+        {!colony.hideCalibrationLambda && (
           <CalibrationLambdaSlider initial={status?.config?.calibration_lambda ?? 0} />
         )}
         <SynapseGainSlider initial={status?.config?.synapse_gain ?? 1} />
@@ -58,8 +63,13 @@ export function ObservePage() {
         </div>
         <FitnessChart data={history} />
         <PopulationChart data={history} popMax={popMax} />
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          <BudgetChart data={history} />
+        <div
+          className={
+            "grid grid-cols-1 gap-4 " +
+            (colony.hideBudgetChart ? "" : "md:grid-cols-2")
+          }
+        >
+          {!colony.hideBudgetChart && <BudgetChart data={history} />}
           <VitalsChart data={history} />
         </div>
       </section>

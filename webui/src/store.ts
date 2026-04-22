@@ -82,11 +82,27 @@ export const useStore = create<State>((set) => ({
       const next = st.history.length >= HISTORY_LIMIT
         ? [...st.history.slice(st.history.length - HISTORY_LIMIT + 1), point]
         : [...st.history, point];
+      // status 是 HTTP /api/status 一次性快照，原本只在 mount/WS-open/start 三个时刻
+      // 被刷新 → t_sim 等动态字段会一直停在启动那一刻的值。
+      // 每帧 telemetry 来时顺手把这几个动态字段回写到 status，让所有读 status.t_sim
+      // 的组件（顶栏、SimHealthBanner 等）自动跟上 latest 的进度。
+      // last_event 也一并同步，方便那些只拿 status 的旧代码路径。
+      const syncedStatus = st.status
+        ? {
+            ...st.status,
+            running: true,
+            t_sim: ev.t_sim,
+            n_living: ev.pop_size,
+            pop_max: ev.pop_max,
+            last_event: ev,
+          }
+        : st.status;
       return {
         latest: ev,
         history: next,
         totalBorn: st.totalBorn + ev.births,
         totalDied: st.totalDied + ev.deaths,
+        status: syncedStatus,
       };
     }),
 }));

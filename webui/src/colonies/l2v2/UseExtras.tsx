@@ -1,7 +1,9 @@
 import { useState } from "react";
 import clsx from "clsx";
-import { api } from "../api";
-import type { InferenceResponse } from "../types";
+import { api } from "../../api";
+import { useStore } from "../../store";
+import { usePersistentState } from "../../hooks/usePersistentState";
+import type { InferenceResponse } from "../../types";
 
 /**
  * SPEC_L2_V2.0 — human-friendly "ask the swarm a logic question" panel.
@@ -78,21 +80,38 @@ function ALL_QUESTIONS(): QuestionSpec[] {
   ];
 }
 
-interface Props {
-  target: "best" | "ensemble" | "random" | "swarm";
+// Self-contained query parameters — LogicTester is the *only* place L2v2
+// users tweak target / topK etc., so it owns its own persistent form (no
+// props, no shared "use-form" key with the L1 legacy panel).
+type QueryTarget = "best" | "ensemble" | "random" | "swarm";
+
+interface QueryFormState {
+  target: QueryTarget;
   topK: number;
   swarmRadius: number;
   durationMs: number;
   warmupMs: number;
 }
 
-export function LogicTester({
-  target,
-  topK,
-  swarmRadius,
-  durationMs,
-  warmupMs,
-}: Props) {
+const QUERY_FORM_DEFAULTS: QueryFormState = {
+  target: "ensemble",   // L2v2 推荐 ensemble 而非 best — 单个 best 常陷"塌陷个体"
+  topK: 10,
+  swarmRadius: 1,
+  durationMs: 500,      // SPEC §2 评估窗口
+  warmupMs: 100,
+};
+
+export function LogicTester() {
+  const [queryForm, setQueryForm] = usePersistentState<QueryFormState>(
+    "l2v2-logic-tester-query",
+    QUERY_FORM_DEFAULTS,
+  );
+  const { target, topK, swarmRadius, durationMs, warmupMs } = queryForm;
+  const setQueryField = <K extends keyof QueryFormState>(
+    k: K,
+    v: QueryFormState[K],
+  ) => setQueryForm((s) => ({ ...s, [k]: v }));
+
   const [mode, setMode] = useState<Mode>("AND");
   const [a, setA] = useState<Bit>(1);
   const [b, setB] = useState<Bit>(1);
@@ -101,8 +120,14 @@ export function LogicTester({
   const [oneShot, setOneShot] = useState<QuestionResult | null>(null);
   const [battery, setBattery] = useState<QuestionResult[] | null>(null);
 
+  // sim health snapshot — used by SimHealthBanner to warn the user before
+  // they get confused by f_out=0 results.
+  const status = useStore((s) => s.status);
+  const latest = useStore((s) => s.latest);
+
   const expected = expectedBit(mode, a, b);
   const currentSpec: QuestionSpec = { mode, a, b, expected };
+  const isHardNotPremium = mode === "NOT" && a === 0; // NOT(0)=1 高难溢价
 
   async function askOne(spec: QuestionSpec): Promise<QuestionResult> {
     const fA = bitToHz(spec.a);
@@ -173,12 +198,28 @@ export function LogicTester({
         </span>
       </div>
 
-      <p className="text-xs text-amber-200/70 mb-4 leading-relaxed">
+      <p className="text-xs text-amber-200/70 mb-3 leading-relaxed">
         点选下面的「指令 + 输入比特」，前端会自动翻译成三通道电平
         （A/B 用 25 Hz=0 / 75 Hz=1，S 用 20 Hz=AND / 80 Hz=NOT），
         喂给当前种群里的目标 agent，再把它的输出 f_out 用 50 Hz 阈值翻译回 0/1。
-        和「使用页 = 输 Hz 数字」相比，这里你直接说人话。
       </p>
+
+      {/* Sim health snapshot — surface g / t_sim / current pop accuracy so
+          the user can interpret f_out=0 results before getting confused. */}
+      <SimHealthBanner
+        gain={status?.config?.synapse_gain ?? 1}
+        tSim={status?.t_sim ?? 0}
+        accAnd={latest?.acc_and_pop ?? 0}
+        accNot={latest?.acc_not_pop ?? 0}
+        bothPass={latest?.both_pass_pct ?? 0}
+      />
+
+      {/* Query target selector — L2v2 自带，不再依赖 L1 的「底层接口」面板 */}
+      <QuerySettings
+        form={queryForm}
+        setField={setQueryField}
+        slimeOn={!!status?.config?.slime_mold}
+      />
 
       {/* Question builder */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mb-3">
@@ -210,7 +251,7 @@ export function LogicTester({
       </div>
 
       {/* Question preview */}
-      <div className="rounded border border-amber-800/40 bg-amber-950/30 px-3 py-2 mb-3 text-sm font-mono flex items-baseline gap-3 flex-wrap">
+      <div className="rounded border border-amber-800/40 bg-amber-950/30 px-3 py-2 mb-1 text-sm font-mono flex items-baseline gap-3 flex-wrap">
         <span className="text-amber-200/60">题目:</span>
         <span className="text-amber-100 font-semibold text-base">
           {questionLabel(currentSpec)}
@@ -221,6 +262,13 @@ export function LogicTester({
           f_a={bitToHz(a).toFixed(0)}Hz · f_b={bitToHz(b).toFixed(0)}Hz · f_s={modeToSHz(mode).toFixed(0)}Hz
         </span>
       </div>
+      {isHardNotPremium && (
+        <div className="mb-3 px-3 py-1.5 text-[11px] text-rose-200/90 bg-rose-950/30 border border-rose-700/40 rounded leading-relaxed">
+          ⚠️ <b>高难溢价题 (ERRATA v2.1)</b>（reward=+25，全套最高）：输入电平很低（A=25Hz）却要求输出
+          <b> 反向激活 </b>到 50Hz 以上。这违反 SNN 的「输入越多 → 输出越多」直觉，
+          需要演化出抑制路径。<b>新启动种群 99% 错</b>，f_out=0 是预期现象 — 但学会的精英能拿半个繁殖代价。
+        </div>
+      )}
 
       {/* Action buttons */}
       <div className="flex flex-wrap gap-3 mb-4">
@@ -260,6 +308,114 @@ export function LogicTester({
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────
+
+/**
+ * Query target settings — picks WHICH agent(s) the LogicTester asks the
+ * question to. SPEC §5.3 elite检测推荐 ensemble (top-K=10)，因为 best 单点
+ * 容易卡在「AND 模式全 silent」的塌陷局部最优（acc_AND=75% 但 1 AND 1 必错）。
+ */
+function QuerySettings({
+  form,
+  setField,
+  slimeOn,
+}: {
+  form: QueryFormState;
+  setField: <K extends keyof QueryFormState>(k: K, v: QueryFormState[K]) => void;
+  slimeOn: boolean;
+}) {
+  const { target, topK, swarmRadius, durationMs, warmupMs } = form;
+  const swarmDisabled = !slimeOn;
+  return (
+    <div className="rounded border border-amber-800/30 bg-slate-950/40 p-3 mb-3">
+      <div className="flex items-baseline justify-between mb-2">
+        <div className="text-[11px] text-amber-200/80 font-semibold">
+          🎯 提问目标（决定让哪些 agent 回答）
+        </div>
+        <div className="text-[10px] text-amber-200/50">
+          推荐 <code className="px-1 bg-slate-900 rounded">ensemble · top-K=10</code>
+          ，单 best 容易卡塌陷
+        </div>
+      </div>
+      <div className="grid grid-cols-2 md:grid-cols-5 gap-2 text-[11px]">
+        <div className="md:col-span-2">
+          <label className="block text-amber-200/70 mb-1">target</label>
+          <select
+            value={target}
+            onChange={(e) => setField("target", e.target.value as QueryTarget)}
+            className="qs-input w-full"
+          >
+            <option value="best">best · fitness 最高单个</option>
+            <option value="ensemble">ensemble · top-K 平均</option>
+            <option value="random">random · 随机活体</option>
+            <option value="swarm" disabled={swarmDisabled}>
+              🍄 swarm · 黏菌 hotspot{swarmDisabled ? "（需开启黏菌）" : ""}
+            </option>
+          </select>
+          <div className="text-[10px] text-slate-500 mt-1 leading-snug">
+            {target === "best" &&
+              "只问 fitness 最高那一个。fitness=mean(acc_AND, acc_NOT)，但塌陷个体也能拿高 fitness — 易误判。"}
+            {target === "ensemble" &&
+              `问 fitness 前 ${topK} 个 agent，输出取平均。能稀释单点塌陷，最稳的"看群体真实水平"方式。`}
+            {target === "random" && "随机活体——抽样看普通成员什么水平。"}
+            {target === "swarm" &&
+              (swarmDisabled
+                ? "需要在设置页勾选「赛博黏菌模式」并重启才能用。"
+                : `问信息素峰值格 ±${swarmRadius} 内的所有活体——共识最强子群。`)}
+          </div>
+        </div>
+        <div>
+          <label className="block text-amber-200/70 mb-1">Top-K</label>
+          <input
+            type="number" min={1} max={50}
+            value={topK}
+            disabled={target !== "ensemble"}
+            onChange={(e) => setField("topK", Math.max(1, Number(e.target.value) | 0))}
+            className="qs-input w-full disabled:opacity-40"
+          />
+          <div className="text-[10px] text-slate-500 mt-1">仅 ensemble</div>
+        </div>
+        <div>
+          <label className="block text-amber-200/70 mb-1">Swarm 半径</label>
+          <input
+            type="number" min={1} max={8}
+            value={swarmRadius}
+            disabled={target !== "swarm"}
+            onChange={(e) => setField("swarmRadius", Math.max(1, Number(e.target.value) | 0))}
+            className="qs-input w-full disabled:opacity-40"
+          />
+          <div className="text-[10px] text-slate-500 mt-1">仅 swarm · ±R 格</div>
+        </div>
+        <div>
+          <label className="block text-amber-200/70 mb-1">duration_ms</label>
+          <input
+            type="number" min={50} max={5000} step={50}
+            value={durationMs}
+            onChange={(e) => setField("durationMs", Math.max(50, Number(e.target.value) | 0))}
+            className="qs-input w-full"
+          />
+          <div className="text-[10px] text-slate-500 mt-1">SPEC=500</div>
+        </div>
+      </div>
+      <details className="mt-2">
+        <summary className="text-[10px] text-slate-500 cursor-pointer hover:text-slate-300 select-none">
+          ▶ 高级：warmup_ms = {warmupMs}
+        </summary>
+        <div className="mt-2">
+          <input
+            type="number" min={0} max={2000} step={10}
+            value={warmupMs}
+            onChange={(e) => setField("warmupMs", Math.max(0, Number(e.target.value) | 0))}
+            className="qs-input w-32"
+          />
+          <span className="text-[10px] text-slate-500 ml-2">
+            冷启动膜电位预热；训练时膜电位是连续的所以 warmup=0，推理时建议 ≥100ms。
+          </span>
+        </div>
+      </details>
+      <style>{`.qs-input{background:#020617;border:1px solid #475569;border-radius:4px;padding:4px 6px;font-family:ui-monospace,monospace;font-size:11px;color:#fde68a;}`}</style>
+    </div>
+  );
+}
 
 function ModeBtn({
   label,
@@ -369,7 +525,7 @@ function OneShotResult({ r }: { r: QuestionResult }) {
 function oneShotComment(r: QuestionResult): string {
   if (r.correct) {
     if (r.mode === "NOT" && r.expected === 1) {
-      return `种群正确给出了「取反结果 = 1」的高难溢价答案 (NOT ${r.a} = 1)。这是 SPEC_L2_V2.0 §2.2 中奖励最丰厚 (+50/scale) 的一类题。`;
+      return `种群正确给出了「取反结果 = 1」的高难溢价答案 (NOT ${r.a} = 1)。这是 ERRATA v2.1 中奖励最丰厚 (+25 scaled) 的一类题。`;
     }
     if (r.mode === "AND" && r.expected === 1) {
       return `种群正确识别了「两个真才为真」的与门语义。`;
@@ -380,7 +536,27 @@ function oneShotComment(r: QuestionResult): string {
   if (r.outBit === 1 && r.expected === 0) {
     return `种群发声了 (f_out=${r.fOutHz.toFixed(0)}Hz > 50Hz)，但本题期望沉默。误激活——可能是 S 指令信号没被识别，或者抑制路径还没演化出来。`;
   }
-  return `种群保持了沉默 (f_out=${r.fOutHz.toFixed(0)}Hz < 50Hz)，但本题期望发声。漏激活——synapse_gain (g) 可能太小，或者该子任务还没被覆盖到。`;
+  // 漏激活 — 区分完全死寂 vs 部分激活
+  if (r.fOutHz <= 0.5) {
+    return (
+      `网络完全沉默 (f_out=0Hz)，但本题期望发声。这通常意味着该 agent 的输出层电流 I_o 小于 LIF 阈值 V_th=1.0 ` +
+      `——膜电位永远爬不到点火门槛。常见原因：` +
+      `① 输出层增益 g 太小（观测页右上 SynapseGainSlider 调到 2~3）；` +
+      `② 种群刚启动，权重还没演化（看上方健康条 t_sim）；` +
+      `③ 这是 NOT(0)=1 高难题，对新种群本就是预期失败。`
+    );
+  }
+  if (r.fOutHz < 25) {
+    return (
+      `网络在低强度发放 (f_out=${r.fOutHz.toFixed(0)}Hz)，离 50Hz 阈值还远。` +
+      `agent 的相关路径已经有微弱响应，但电流不足以稳定触发输出。` +
+      `提高 synapse_gain g（推荐 2~3）或继续演化通常能压过阈值。`
+    );
+  }
+  return (
+    `网络在中强度发放 (f_out=${r.fOutHz.toFixed(0)}Hz)，但还差一点没过 50Hz。` +
+    `离正确答案非常近——再演化几分钟、或者把 g 微调高一档，下次很可能就过了。`
+  );
 }
 
 function BatteryResult({ results }: { results: QuestionResult[] }) {
@@ -483,6 +659,114 @@ function Cell({
     <div className="rounded bg-slate-950/40 px-2 py-1.5">
       <div className="text-[10px] text-slate-400">{label}</div>
       <div className={clsx("text-base font-bold", colors[accent])}>{value}</div>
+    </div>
+  );
+}
+
+/**
+ * Sim health snapshot — surfaces the three things that most often explain
+ * "why is f_out always 0?" before the user asks:
+ *   - synapse_gain g  (输出层电流缩放，<1.5 容易让 LIF 永远不点火)
+ *   - t_sim          (太短 → fitness 还没 defined → best 选到未演化祖先)
+ *   - acc_AND / acc_NOT 群体准确率 (< 0.5 = 还在猜)
+ *
+ * Each row colours itself green / amber / rose based on whether it's likely
+ * to be the bottleneck.
+ */
+function SimHealthBanner({
+  gain,
+  tSim,
+  accAnd,
+  accNot,
+  bothPass,
+}: {
+  gain: number;
+  tSim: number;
+  accAnd: number;
+  accNot: number;
+  bothPass: number;
+}) {
+  const gainBad = gain < 1.5;
+  const gainOk = gain >= 2.0;
+  const youngSim = tSim < 60;
+  const matureSim = tSim >= 600;
+  const accAvg = 0.5 * (accAnd + accNot);
+  const learning = accAvg >= 0.6;
+  const struggling = accAvg < 0.4;
+
+  return (
+    <div className="rounded border border-amber-800/30 bg-slate-950/40 px-3 py-2 mb-3 grid grid-cols-1 md:grid-cols-3 gap-3 text-[11px]">
+      <HealthRow
+        label="输出增益 g"
+        value={gain.toFixed(2)}
+        status={gainOk ? "ok" : gainBad ? "bad" : "warn"}
+        hint={
+          gainBad
+            ? "g<1.5：LIF 输出层很可能永远不点火 → f_out=0。建议到「观测」页右上把 g 调到 2~3。"
+            : gainOk
+              ? "g≥2，输出层有足够电流穿透 V_th=1.0 阈值。"
+              : "g 适中。如果常看到 f_out=0，可以再抬一点。"
+        }
+      />
+      <HealthRow
+        label="演化时长 t_sim"
+        value={`${tSim.toFixed(0)}s`}
+        status={matureSim ? "ok" : youngSim ? "bad" : "warn"}
+        hint={
+          youngSim
+            ? "t_sim<60s：fitness 多半还没 defined（要求 AND/NOT 两种 mode 都见过）；best 会退化为「未演化的随机权重」，输出几乎随机。"
+            : matureSim
+              ? "已演化≥10min，fitness 基本都 defined。"
+              : "中段演化中，部分 agent 已 defined。"
+        }
+      />
+      <HealthRow
+        label="群体准确率 (AND+NOT)/2"
+        value={`${(accAvg * 100).toFixed(0)}%`}
+        status={learning ? "ok" : struggling ? "bad" : "warn"}
+        hint={
+          struggling
+            ? `acc_AND=${(accAnd * 100).toFixed(0)}% / acc_NOT=${(accNot * 100).toFixed(0)}%。<40% 接近随机猜。`
+            : learning
+              ? `acc_AND=${(accAnd * 100).toFixed(0)}% / acc_NOT=${(accNot * 100).toFixed(0)}%；精英率 ${(bothPass * 100).toFixed(1)}% 同时通过两种。`
+              : `acc_AND=${(accAnd * 100).toFixed(0)}% / acc_NOT=${(accNot * 100).toFixed(0)}%。在学习中。`
+        }
+      />
+    </div>
+  );
+}
+
+function HealthRow({
+  label,
+  value,
+  status,
+  hint,
+}: {
+  label: string;
+  value: string;
+  status: "ok" | "warn" | "bad";
+  hint: string;
+}) {
+  const dotColor = {
+    ok: "bg-emerald-400",
+    warn: "bg-amber-400",
+    bad: "bg-rose-400",
+  }[status];
+  const valueColor = {
+    ok: "text-emerald-300",
+    warn: "text-amber-300",
+    bad: "text-rose-300",
+  }[status];
+  return (
+    <div className="flex items-start gap-2">
+      <span className={clsx("inline-block w-2 h-2 rounded-full mt-1.5 shrink-0", dotColor)} />
+      <div className="min-w-0 flex-1">
+        <div className="flex items-baseline gap-2">
+          <span className="text-slate-400">{label}</span>
+          <span className={clsx("font-mono font-semibold", valueColor)}>{value}</span>
+        </div>
+        <div className="text-[10px] text-slate-500 leading-snug mt-0.5">{hint}</div>
+      </div>
     </div>
   );
 }

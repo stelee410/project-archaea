@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef } from "react";
 import clsx from "clsx";
-import { useStore, type ChartPoint } from "../store";
-import type { OracleSnapshot, TelemetryEvent } from "../types";
+import { useStore, type ChartPoint } from "../../store";
+import type { OracleSnapshot, TelemetryEvent } from "../../types";
 
 /**
  * SPEC_L2_V2.0 §4 — Ecological dashboard for non-technical observers.

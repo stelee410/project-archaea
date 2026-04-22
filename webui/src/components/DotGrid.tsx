@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { TelemetryEvent } from "../types";
 
 interface Props {
@@ -19,34 +19,58 @@ function dotColor(alive: boolean, credit: number): string {
   const t = Math.min(1, credit / C_REPRO);
   if (t >= 0.55) {
     const g = 195 + Math.round(60 * ((t - 0.55) / 0.45));
-    return `rgb(33, ${g}, 96)`;
+    return `rgb(33,${g},96)`;
   }
   if (t >= 0.25) return "#eab308";
   return "#f97316";
 }
 
 // Hunger fade: agents with low credit get drawn at reduced alpha.
-// 0.0 (invisible) → 1.0 (full opacity).
-function hungerAlpha(credit: number): number {
-  if (credit >= HUNGER_CREDIT) return 1.0;
-  return Math.max(0.25, credit / HUNGER_CREDIT);
+// Quantized to 5 bins so the per-color batching can also key on alpha.
+function hungerAlphaBin(credit: number): number {
+  if (credit >= HUNGER_CREDIT) return 5;
+  if (credit >= 15) return 4;
+  if (credit >= 10) return 3;
+  if (credit >= 5) return 2;
+  return 1;
 }
+const ALPHA_FROM_BIN = [0, 0.25, 0.4, 0.55, 0.75, 1.0];
 
 export function DotGrid({ ev, popMax, selectedSlot, onSelect }: Props) {
-  const ref = useRef<HTMLCanvasElement | null>(null);
+  const wrapRef = useRef<HTMLDivElement | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const slimeMode = !!(ev?.slime_enabled && ev?.grid_size > 0);
   const cols = useMemo(() => Math.ceil(Math.sqrt(popMax)), [popMax]);
   const rows = useMemo(() => Math.ceil(popMax / cols), [popMax, cols]);
 
+  // ── Canvas physical sizing (HiDPI + container resize) ────────────────────
+  // We let the canvas fill its parent and bump physical resolution by DPR.
+  // pop_max scales: small grids look crisper on retina; large grids get more
+  // pixels per dot which keeps clicks accurate.
+  const [pxSize, setPxSize] = useState({ w: 780, h: 520 });
+  useEffect(() => {
+    const wrap = wrapRef.current;
+    if (!wrap) return;
+    const ro = new ResizeObserver((entries) => {
+      for (const e of entries) {
+        const { width, height } = e.contentRect;
+        // height: keep ~2:3 ratio with width but cap by container itself.
+        // legend below sits outside the canvas, so we use the container's
+        // own measured height via flex.
+        const h = Math.max(360, Math.min(900, Math.floor(height)));
+        setPxSize({ w: Math.floor(width), h });
+      }
+    });
+    ro.observe(wrap);
+    return () => ro.disconnect();
+  }, []);
+
   const eventChildren = useMemo(() => new Set(ev?.repro_child_slots ?? []), [ev]);
   const eventParents = useMemo(() => new Set(ev?.repro_parent_slots ?? []), [ev]);
   const eventDeads = useMemo(() => new Set(ev?.dead_slots ?? []), [ev]);
-  // SPEC_L2_V2.0 §4.2 — slots that received non-trivial reward this window.
-  // These flash gold in the next paint.
   const goldenSlots = useMemo(() => {
     const r = ev?.reward;
     if (!r) return new Set<number>();
-    // Threshold: any positive reward this window counts as "earned" → flash.
     const out = new Set<number>();
     for (let i = 0; i < r.length; i++) {
       if (r[i] > 0.5) out.add(i);
@@ -56,15 +80,24 @@ export function DotGrid({ ev, popMax, selectedSlot, onSelect }: Props) {
   const hgtPairs = useMemo(() => ev?.hgt_pairs ?? [], [ev]);
 
   useEffect(() => {
-    const cv = ref.current;
+    const cv = canvasRef.current;
     if (!cv) return;
     const ctx = cv.getContext("2d");
     if (!ctx) return;
-    const W = cv.width;
-    const H = cv.height;
-    ctx.clearRect(0, 0, W, H);
+
+    const dpr = window.devicePixelRatio || 1;
+    const cssW = pxSize.w;
+    const cssH = pxSize.h;
+    if (cv.width !== cssW * dpr || cv.height !== cssH * dpr) {
+      cv.width = Math.max(1, Math.floor(cssW * dpr));
+      cv.height = Math.max(1, Math.floor(cssH * dpr));
+    }
+    // Use CSS-pixel coordinates inside the draw functions.
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    ctx.clearRect(0, 0, cssW, cssH);
     ctx.fillStyle = "#0f172a";
-    ctx.fillRect(0, 0, W, H);
+    ctx.fillRect(0, 0, cssW, cssH);
 
     const sets: OverlaySets = {
       children: eventChildren,
@@ -74,24 +107,26 @@ export function DotGrid({ ev, popMax, selectedSlot, onSelect }: Props) {
       hgtPairs,
     };
     if (slimeMode && ev) {
-      drawSpatial(ctx, W, H, ev, selectedSlot, sets);
+      drawSpatial(ctx, cssW, cssH, ev, selectedSlot, sets);
     } else {
-      drawSlotGrid(ctx, W, H, ev, popMax, cols, rows, selectedSlot, sets);
+      drawSlotGrid(ctx, cssW, cssH, ev, popMax, cols, rows, selectedSlot, sets);
     }
-  }, [ev, popMax, cols, rows, selectedSlot, eventChildren, eventParents, eventDeads, slimeMode, goldenSlots, hgtPairs]);
+  }, [ev, popMax, cols, rows, selectedSlot, eventChildren, eventParents, eventDeads, slimeMode, goldenSlots, hgtPairs, pxSize]);
 
   function handleClick(e: React.MouseEvent<HTMLCanvasElement>) {
-    const cv = ref.current;
+    const cv = canvasRef.current;
     if (!cv) return;
     const rect = cv.getBoundingClientRect();
-    const x = ((e.clientX - rect.left) / rect.width) * cv.width;
-    const y = ((e.clientY - rect.top) / rect.height) * cv.height;
+    // Note: we draw in CSS pixels via setTransform(dpr,...), so map clicks
+    // back to CSS pixel space too.
+    const x = ((e.clientX - rect.left) / rect.width) * pxSize.w;
+    const y = ((e.clientY - rect.top) / rect.height) * pxSize.h;
 
     if (slimeMode && ev) {
       const G = ev.grid_size;
       const pad = 8;
-      const cellW = (cv.width - pad * 2) / G;
-      const cellH = (cv.height - pad * 2) / G;
+      const cellW = (pxSize.w - pad * 2) / G;
+      const cellH = (pxSize.h - pad * 2) / G;
       let bestSlot = -1;
       let bestD = Infinity;
       for (let s = 0; s < ev.alive.length; s++) {
@@ -110,8 +145,8 @@ export function DotGrid({ ev, popMax, selectedSlot, onSelect }: Props) {
     }
 
     const pad = 8;
-    const dxAvail = (cv.width - pad * 2) / cols;
-    const dyAvail = (cv.height - pad * 2) / rows;
+    const dxAvail = (pxSize.w - pad * 2) / cols;
+    const dyAvail = (pxSize.h - pad * 2) / rows;
     const c = Math.floor((x - pad) / dxAvail);
     const r = Math.floor((y - pad) / dyAvail);
     if (c < 0 || c >= cols || r < 0 || r >= rows) return;
@@ -120,13 +155,12 @@ export function DotGrid({ ev, popMax, selectedSlot, onSelect }: Props) {
   }
 
   return (
-    <div className="w-full h-full flex flex-col">
+    <div ref={wrapRef} className="w-full flex flex-col" style={{ minHeight: 380 }}>
       <canvas
-        ref={ref}
-        width={780}
-        height={520}
+        ref={canvasRef}
         onClick={handleClick}
-        className="w-full h-full rounded border border-slate-800 cursor-pointer"
+        style={{ width: "100%", height: pxSize.h, display: "block" }}
+        className="rounded border border-slate-800 cursor-pointer"
       />
       {slimeMode ? (
         <div className="mt-2 flex flex-wrap gap-3 text-[11px] text-slate-400">
@@ -157,7 +191,9 @@ export function DotGrid({ ev, popMax, selectedSlot, onSelect }: Props) {
           <Legend dot="#f9a8d4" label="亲代" />
           <Legend dot="#94a3b8" label="饿死" />
           <Legend dot="#a855f7" label="HGT 连线" />
-          <span className="ml-auto text-slate-500">点击 dot → 右侧查看 agent 内部 10→20→1 拓扑</span>
+          <span className="ml-auto text-slate-500">
+            点击 dot → 右侧查看拓扑 · {popMax} 槽 · {cols}×{rows}
+          </span>
         </div>
       )}
     </div>
@@ -168,12 +204,21 @@ interface OverlaySets {
   children: Set<number>;
   parents: Set<number>;
   deads: Set<number>;
-  // SPEC_L2_V2.0 §4.2 — slots that earned reward this window (flash gold)
   golden: Set<number>;
-  // SPEC_L2_V2.0 §4.2 — [recipient_slot, donor_slot] pairs for HGT social lines
   hgtPairs: [number, number][];
 }
 
+/**
+ * Slot-grid renderer (no-slime mode).
+ *
+ * Performance strategy (so 1000–5000 dots stay 60 fps):
+ *
+ *   1. Bucket dots by (color, alpha-bin) — typically 5–8 buckets.
+ *   2. For r > 3 px: build one Path2D per bucket, single ctx.fill() call.
+ *   3. For r ≤ 3 px: fillRect pixel squares (≈3× faster than tiny arc()s).
+ *   4. Overlays (gold halo, parent/child rings, HGT lines) are drawn after,
+ *      and they are always sparse (only this-window events).
+ */
 function drawSlotGrid(
   ctx: CanvasRenderingContext2D,
   W: number,
@@ -185,41 +230,77 @@ function drawSlotGrid(
   selectedSlot: number | null,
   sets: OverlaySets
 ) {
-  const pad = 8;
+  const pad = 6;
   const dxAvail = (W - pad * 2) / cols;
   const dyAvail = (H - pad * 2) / rows;
-  const r = Math.max(2.5, Math.min(dxAvail, dyAvail) * 0.42);
+  // dot 直径 = 格子宽 × 2 × 系数。0.32 → dot 占 64% 格子，留 36% 给间距，
+  // 视觉比之前的 0.42（占 84%、几乎挤满）清爽得多；min=1.0 让超密集时
+  // 像素方块路径仍能输出 2×2 px 的可见点。
+  const r = Math.max(1.0, Math.min(dxAvail, dyAvail) * 0.32);
 
-  // Pre-compute slot centres so HGT lines can reference them.
-  const centres: { x: number; y: number }[] = [];
-  for (let s = 0; s < popMax; s++) {
-    centres.push({
-      x: pad + ((s % cols) + 0.5) * dxAvail,
-      y: pad + (Math.floor(s / cols) + 0.5) * dyAvail,
-    });
-  }
+  // Bucket centres by (color, alpha-bin). Single pass over popMax.
+  // Key: `${color}|${alphaBin}` keeps batching simple.
+  const buckets = new Map<string, { color: string; alpha: number; pts: { x: number; y: number }[] }>();
+  const pushBucket = (color: string, bin: number, x: number, y: number) => {
+    const alpha = ALPHA_FROM_BIN[bin];
+    const key = `${color}|${bin}`;
+    let b = buckets.get(key);
+    if (!b) {
+      b = { color, alpha, pts: [] };
+      buckets.set(key, b);
+    }
+    b.pts.push({ x, y });
+  };
 
+  // Centres are needed twice — once for batch draw, once for HGT lines and
+  // overlay events. Storing them is O(N) memory, fine for popMax up to ~10k.
+  const centres = new Float32Array(popMax * 2);
   for (let s = 0; s < popMax; s++) {
-    const { x: cx, y: cy } = centres[s];
+    const cx = pad + ((s % cols) + 0.5) * dxAvail;
+    const cy = pad + (Math.floor(s / cols) + 0.5) * dyAvail;
+    centres[s * 2] = cx;
+    centres[s * 2 + 1] = cy;
     const alive = ev ? !!ev.alive[s] : false;
     const credit = ev ? ev.credit[s] : 0;
-    const alpha = alive ? hungerAlpha(credit) : 1.0;
-    ctx.globalAlpha = alpha;
-    ctx.beginPath();
-    ctx.arc(cx, cy, r, 0, Math.PI * 2);
-    ctx.fillStyle = dotColor(alive, credit);
-    ctx.fill();
-    ctx.globalAlpha = 1.0;
-    drawOverlay(ctx, cx, cy, r, s, sets);
-    if (selectedSlot === s) {
-      ctx.beginPath();
-      ctx.arc(cx, cy, r + 3, 0, Math.PI * 2);
-      ctx.strokeStyle = "#22d3ee";
-      ctx.lineWidth = 2;
-      ctx.stroke();
-    }
+    const color = dotColor(alive, credit);
+    const bin = alive ? hungerAlphaBin(credit) : 5;
+    pushBucket(color, bin, cx, cy);
   }
 
+  const usePixelMode = r <= 3.0;
+  if (usePixelMode) {
+    // Fast path: filled squares centred on dot. ~3× faster than arc() at
+    // tiny radii and visually identical (sub-pixel circles look square anyway).
+    const side = Math.max(2, Math.round(r * 2));
+    const off = side / 2;
+    for (const b of buckets.values()) {
+      ctx.globalAlpha = b.alpha;
+      ctx.fillStyle = b.color;
+      for (let i = 0; i < b.pts.length; i++) {
+        const p = b.pts[i];
+        ctx.fillRect(p.x - off, p.y - off, side, side);
+      }
+    }
+    ctx.globalAlpha = 1.0;
+  } else {
+    // Quality path: one Path2D per (color, alpha) bucket, single fill().
+    for (const b of buckets.values()) {
+      const path = new Path2D();
+      for (let i = 0; i < b.pts.length; i++) {
+        const p = b.pts[i];
+        // moveTo before arc avoids "connect-the-dots" artefact between sub-paths.
+        path.moveTo(p.x + r, p.y);
+        path.arc(p.x, p.y, r, 0, Math.PI * 2);
+      }
+      ctx.globalAlpha = b.alpha;
+      ctx.fillStyle = b.color;
+      ctx.fill(path);
+    }
+    ctx.globalAlpha = 1.0;
+  }
+
+  // Overlays — always sparse (this-window events only), so per-slot loop is fine.
+  drawOverlays(ctx, popMax, centres, r, sets, selectedSlot);
   drawHgtLines(ctx, sets.hgtPairs, centres);
 }
 
@@ -258,7 +339,6 @@ function drawSpatial(
     ctx.stroke();
   }
 
-  // Count agents per cell to jitter overlapping dots.
   const cellCounts = new Map<number, number>();
   const cellSeen = new Map<number, number>();
   for (let s = 0; s < ev.alive.length; s++) {
@@ -268,8 +348,16 @@ function drawSpatial(
     cellCounts.set(key, (cellCounts.get(key) ?? 0) + 1);
   }
 
-  const r = Math.max(2.5, Math.min(cellW, cellH) * 0.28);
-  // Per-agent screen positions (needed for HGT lines below).
+  const r = Math.max(1.5, Math.min(cellW, cellH) * 0.28);
+  // Spatial / slime mode: draw each agent individually.
+  //
+  // Why no batching here: when several agents share a cell we jitter them
+  // around the cell centre by ~22% of cellW. If we then build one Path2D
+  // per colour bucket and fill once, neighbouring jittered circles merge
+  // into a single blob (looks like a flower / clover). Per-agent stroke +
+  // fill keeps each dot visually distinct so you can tell "3 agents in
+  // this cell" apart from "1 agent". Slime mode is bounded by grid_size,
+  // typically <1000 living agents — per-circle draw is fine.
   const slotXY = new Map<number, { x: number; y: number }>();
   for (let s = 0; s < ev.alive.length; s++) {
     if (!ev.alive[s]) continue;
@@ -287,14 +375,21 @@ function drawSpatial(
       cy += Math.sin(angle) * radius;
     }
     slotXY.set(s, { x: cx, y: cy });
-    const alpha = hungerAlpha(ev.credit[s]);
+    const credit = ev.credit[s];
+    const alpha = ALPHA_FROM_BIN[hungerAlphaBin(credit)];
     ctx.globalAlpha = alpha;
     ctx.beginPath();
     ctx.arc(cx, cy, r, 0, Math.PI * 2);
-    ctx.fillStyle = dotColor(true, ev.credit[s]);
+    ctx.fillStyle = dotColor(true, credit);
     ctx.fill();
+    // Thin dark rim helps separate adjacent / overlapping agents.
+    if (total > 1) {
+      ctx.lineWidth = 1;
+      ctx.strokeStyle = "rgba(15,23,42,0.85)";
+      ctx.stroke();
+    }
     ctx.globalAlpha = 1.0;
-    drawOverlay(ctx, cx, cy, r, s, sets);
+    drawSingleOverlay(ctx, cx, cy, r, s, sets);
     if (selectedSlot === s) {
       ctx.beginPath();
       ctx.arc(cx, cy, r + 3, 0, Math.PI * 2);
@@ -304,7 +399,7 @@ function drawSpatial(
     }
   }
 
-  // HGT social lines — only between two living agents we actually drew.
+  // HGT social lines
   ctx.save();
   ctx.strokeStyle = "rgba(168, 85, 247, 0.65)";
   ctx.lineWidth = 1.4;
@@ -321,29 +416,38 @@ function drawSpatial(
   ctx.restore();
 }
 
-function drawHgtLines(
+/** Iterate only the slots that have an event this window. */
+function drawOverlays(
   ctx: CanvasRenderingContext2D,
-  pairs: [number, number][],
-  centres: { x: number; y: number }[]
+  popMax: number,
+  centres: Float32Array,
+  r: number,
+  sets: OverlaySets,
+  selectedSlot: number | null
 ) {
-  if (pairs.length === 0) return;
-  ctx.save();
-  ctx.strokeStyle = "rgba(168, 85, 247, 0.6)";
-  ctx.lineWidth = 1.2;
-  ctx.setLineDash([4, 3]);
-  for (const [recipient, donor] of pairs) {
-    const a = centres[recipient];
-    const b = centres[donor];
-    if (!a || !b) continue;
+  // Iterate the small overlay sets directly instead of looping all popMax slots.
+  const visit = (s: number) => {
+    if (s < 0 || s >= popMax) return;
+    const cx = centres[s * 2];
+    const cy = centres[s * 2 + 1];
+    drawSingleOverlay(ctx, cx, cy, r, s, sets);
+  };
+  for (const s of sets.golden) visit(s);
+  for (const s of sets.children) visit(s);
+  for (const s of sets.parents) visit(s);
+  for (const s of sets.deads) visit(s);
+  if (selectedSlot != null && selectedSlot >= 0 && selectedSlot < popMax) {
+    const cx = centres[selectedSlot * 2];
+    const cy = centres[selectedSlot * 2 + 1];
     ctx.beginPath();
-    ctx.moveTo(a.x, a.y);
-    ctx.lineTo(b.x, b.y);
+    ctx.arc(cx, cy, r + 3, 0, Math.PI * 2);
+    ctx.strokeStyle = "#22d3ee";
+    ctx.lineWidth = 2;
     ctx.stroke();
   }
-  ctx.restore();
 }
 
-function drawOverlay(
+function drawSingleOverlay(
   ctx: CanvasRenderingContext2D,
   cx: number,
   cy: number,
@@ -351,7 +455,6 @@ function drawOverlay(
   s: number,
   sets: OverlaySets
 ) {
-  // SPEC_L2_V2.0 §4.2 — gold halo for agents earning Credit this window.
   if (sets.golden.has(s)) {
     ctx.save();
     const grd = ctx.createRadialGradient(cx, cy, r * 0.6, cx, cy, r * 2.2);
@@ -370,10 +473,14 @@ function drawOverlay(
     ctx.restore();
   }
   if (sets.children.has(s)) {
+    ctx.beginPath();
+    ctx.arc(cx, cy, r + 1.2, 0, Math.PI * 2);
     ctx.strokeStyle = "#ec4899";
     ctx.lineWidth = 2;
     ctx.stroke();
   } else if (sets.parents.has(s)) {
+    ctx.beginPath();
+    ctx.arc(cx, cy, r + 1.2, 0, Math.PI * 2);
     ctx.strokeStyle = "#f9a8d4";
     ctx.lineWidth = 2;
     ctx.stroke();
@@ -386,8 +493,31 @@ function drawOverlay(
   }
 }
 
+function drawHgtLines(
+  ctx: CanvasRenderingContext2D,
+  pairs: [number, number][],
+  centres: Float32Array
+) {
+  if (pairs.length === 0) return;
+  ctx.save();
+  ctx.strokeStyle = "rgba(168, 85, 247, 0.6)";
+  ctx.lineWidth = 1.2;
+  ctx.setLineDash([4, 3]);
+  for (const [recipient, donor] of pairs) {
+    const ax = centres[recipient * 2];
+    const ay = centres[recipient * 2 + 1];
+    const bx = centres[donor * 2];
+    const by = centres[donor * 2 + 1];
+    if (Number.isNaN(ax) || Number.isNaN(bx)) continue;
+    ctx.beginPath();
+    ctx.moveTo(ax, ay);
+    ctx.lineTo(bx, by);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
 function pheromoneColor(t: number): string {
-  // Dark slate → fuchsia → amber, perceptually scaled.
   const v = Math.max(0, Math.min(1, t));
   if (v < 0.5) {
     const a = v / 0.5;
