@@ -33,6 +33,10 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .runtime import SimConfig, get_runtime
+from .strain import (
+    delete_strain,
+    list_strains,
+)
 
 
 class SimConfigBody(BaseModel):
@@ -60,6 +64,30 @@ class SimConfigBody(BaseModel):
     synapse_gain: float = Field(1.0, gt=0.0, le=20.0)
     # SPEC_L2_V2.0 — evolution task
     task: Literal["l1", "l2v2_ctrl"] = "l1"
+    # SPEC_L2_V2.0 §0 — environment shaping preset (only used for l2v2_ctrl).
+    task_difficulty: Literal[
+        "uniform", "balanced", "hard", "extreme", "and_only", "not_only"
+    ] = "balanced"
+    # SPEC_L2_V3.0 — admixture experiment (杂交皿).
+    founders: list["FounderEntry"] | None = None
+    admixture_window_s: float = Field(0.0, ge=0.0, le=600.0)
+    admixture_hgt_multiplier: float = Field(5.0, ge=1.0, le=50.0)
+
+
+class FounderEntry(BaseModel):
+    strain_id: str
+    fraction: float = Field(0.5, gt=0.0, le=1.0)
+
+
+class StrainSaveBody(BaseModel):
+    name: str = Field(..., min_length=1, max_length=120)
+    note: str = Field("", max_length=500)
+
+
+# Resolve the forward-ref FounderEntry inside SimConfigBody now that
+# FounderEntry is in scope.  Pydantic v2 needs this since SimConfigBody was
+# defined first (so the docstring stays at the top).
+SimConfigBody.model_rebuild()
 
 
 class InferenceBody(BaseModel):
@@ -160,6 +188,14 @@ async def api_start(body: SimConfigBody) -> dict[str, Any]:
         calibration_lambda=body.calibration_lambda,
         synapse_gain=body.synapse_gain,
         task=body.task,
+        task_difficulty=body.task_difficulty,
+        founders=(
+            [{"strain_id": f.strain_id, "fraction": f.fraction} for f in body.founders]
+            if body.founders
+            else None
+        ),
+        admixture_window_s=body.admixture_window_s,
+        admixture_hgt_multiplier=body.admixture_hgt_multiplier,
     )
     try:
         return get_runtime().start(cfg)
@@ -272,6 +308,37 @@ async def api_agent(slot: int) -> dict[str, Any]:
 @app.get("/api/feedback-log")
 async def api_feedback_log(limit: int = 100) -> list[dict[str, Any]]:
     return get_runtime().feedback_log(limit=int(limit))
+
+
+# ── SPEC_L2_V3.0 — strain (菌株) endpoints ────────────────────────────────
+
+
+@app.get("/api/strains")
+async def api_list_strains() -> list[dict[str, Any]]:
+    """Return metadata for all saved strains (cheap; reads only sidecar JSONs)."""
+    return [m.to_dict() for m in list_strains()]
+
+
+@app.post("/api/strains/save")
+async def api_save_strain(body: StrainSaveBody) -> dict[str, Any]:
+    """Snapshot the currently-living population as a new strain on disk."""
+    rt = get_runtime()
+    if not rt.is_running():
+        raise HTTPException(status_code=409, detail="simulation not running")
+    try:
+        return await asyncio.to_thread(rt.snapshot_strain, name=body.name, note=body.note)
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.delete("/api/strains/{strain_id}")
+async def api_delete_strain(strain_id: str) -> dict[str, Any]:
+    removed = delete_strain(strain_id)
+    if not removed:
+        raise HTTPException(status_code=404, detail=f"strain not found: {strain_id}")
+    return {"removed": True, "id": strain_id}
 
 
 @app.websocket("/ws/telemetry")

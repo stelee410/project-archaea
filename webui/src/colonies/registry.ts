@@ -85,11 +85,17 @@ export const COLONIES: ColonyMeta[] = [
     intro:
       "在「模仿」之上多了两条输入：B（第二路数据）和 S（指令）。S 的频率告诉群落「现在考你 AND 还是 NOT」，" +
       "群落必须根据 S 切换内部计算路径。引入抑制突触（权重 ∈ [-1.5, 1.5]）让「否决 / NOT」逻辑成为可能。\n" +
-      "Oracle 真值表给奖励（v2.1 反塌陷重平衡）：AND(1,1)=+15、NOT(0,*)=+25（高难溢价）；" +
-      "silent 正确仅 +0.5/+1（低于 breath 1.25），「永远不开口」会饿死。Fitness = mean(acc_AND, acc_NOT)。",
+      "Oracle 真值表给奖励（v2.2 软着陆）：AND(1,1)=+15、NOT(0,*)=+25（高难溢价）；" +
+      "silent 正确 +2.0/+2.5。\n" +
+      "ERRATA v2.3 加权采样：1∧1 占 AND 题的 50%、NOT 0 占 NOT 题的 50%，" +
+      "总体 P(target=1)=50%。silent 天花板从 75% 降到 50% — 偷懒不再能伪装高分；" +
+      "silent 净亏 0.125/win 慢慢淘汰，完美 +9.9/win 暴富。Fitness = mean(acc_AND, acc_NOT)。\n" +
+      "想专门按 AND 或 NOT 训练？翻到设置页下方的「② 单门培养皿」选 " +
+      "and_only / not_only — 这是 ⚗️ 杂交皿(SPEC_L2_V3.0)的标准前置流程。",
     configDefaults: {
-      // 输出 bit 判定靠 f_out > 50Hz；默认 g=1 经常压不上去，群落跑出的"对答案"
-      // 会被阈值砍掉。L2v2 推荐先把 g 抬高，再视觉化结果。
+      // 输出 bit 判定靠 f_out > OUT_SPIKING_THRESHOLD_HZ (v2.4: 20Hz, 原 50Hz)；
+      // 默认 g=1 经常压不上去，群落跑出的"对答案"会被阈值砍掉。
+      // L2v2 推荐先把 g 抬高，再视觉化结果。
       synapse_gain: 2.0,
     },
     hideCalibrationLambda: true,

@@ -5,6 +5,7 @@ import { AgentDetail } from "../components/AgentDetail";
 import { StatsTable } from "../components/StatsTable";
 import { CalibrationLambdaSlider } from "../components/CalibrationLambdaSlider";
 import { SynapseGainSlider } from "../components/SynapseGainSlider";
+import { StrainBar } from "../components/StrainBar";
 import {
   BudgetChart,
   FitnessChart,
@@ -47,6 +48,9 @@ export function ObservePage({ colony }: Props) {
           <CalibrationLambdaSlider initial={status?.config?.calibration_lambda ?? 0} />
         )}
         <SynapseGainSlider initial={status?.config?.synapse_gain ?? 1} />
+      </div>
+      <div className="col-span-12">
+        <StrainBar ev={latest} />
       </div>
       {/* 左大块：dot grid */}
       <section className="col-span-12 lg:col-span-8 space-y-4">

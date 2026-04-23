@@ -234,7 +234,7 @@ export function UsePage({ colony }: UsePageProps) {
   //   - 底层接口（直接喂 Hz）  : 上方 LogicTester 已能按 SPEC 翻译成多通道电平
   //   - 打分（手动 ±Credit）   : Oracle 真值表已自动评分，手动会扰乱演化方向
   //   - 实时跟随（鼠标驱动）   : 频率跟随的可视化，逻辑题没有"跟随"概念
-  //   - Sweep 测试（扫频图）   : 逻辑题输出只关心 bit (>50Hz)，扫频曲线无意义
+  //   - Sweep 测试（扫频图）   : 逻辑题输出只关心 bit (>OUT_SPIKING_THRESHOLD_HZ, v2.4=20Hz)，扫频曲线无意义
   // 但保留它们便于偶尔做底层探针 → 整体打包成默认折叠的 <details>。
   const legacyTools = (
     <>
@@ -405,7 +405,7 @@ export function UsePage({ colony }: UsePageProps) {
           {demoteLegacy ? (
             <div className="px-3 py-2 rounded bg-slate-950/60 border border-slate-700/60 text-xs text-slate-400 leading-relaxed">
               ⓘ 当前群落（{colony.emoji} {colony.name}）已有 <b className="text-slate-200">Oracle 真值表自动评分</b>
-              （NOT(0)=+25 / AND(1,1)=+15 / silent正确=+0.5~1.0 Credit），手动 ±5 会和 Oracle 争夺信用分配、
+              （NOT(0)=+25 / AND(1,1)=+15 / silent正确=+2.0~2.5 Credit），手动 ±5 会和 Oracle 争夺信用分配、
               <span className="text-rose-300">扰乱演化方向</span>，所以这里禁用。
               如果只是想看 agent 输出对不对，用上方的「<b>问这一题</b>」面板。
             </div>
@@ -479,7 +479,7 @@ export function UsePage({ colony }: UsePageProps) {
             <div className="px-5 pb-5 space-y-5 border-t border-slate-800">
               <div className="pt-5 px-3 py-2 rounded bg-amber-950/20 border border-amber-700/30 text-xs text-amber-200/80 leading-relaxed">
                 ⚠️ 下面这些是 L1「频率跟随」时代的工具：单通道 Hz 输入、扫频画 f_in/f_out 曲线、
-                鼠标拖拽实时跟随。逻辑门控任务的输出只关心 bit（{">"}/{"<"} 50Hz），这些可视化对它没有意义；
+                鼠标拖拽实时跟随。逻辑门控任务的输出只关心 bit（{">"}/{"<"} 20Hz, v2.4 阈值），这些可视化对它没有意义；
                 打分按钮已禁用避免与 Oracle 自动评分冲突。仅在你想做底层探针（验证 g 是否够、看 swarm 是否在工作）时展开。
               </div>
               {legacyTools}

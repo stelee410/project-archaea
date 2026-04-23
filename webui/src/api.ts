@@ -8,6 +8,7 @@ import type {
   ServerEvent,
   SimConfig,
   SimStatus,
+  StrainMeta,
   SweepRequest,
   SweepResponse,
 } from "./types";
@@ -17,6 +18,15 @@ const J = { "Content-Type": "application/json" };
 async function jget<T>(path: string): Promise<T> {
   const r = await fetch(path);
   if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+  return r.json() as Promise<T>;
+}
+
+async function jdel<T>(path: string): Promise<T> {
+  const r = await fetch(path, { method: "DELETE" });
+  if (!r.ok) {
+    const txt = await r.text().catch(() => r.statusText);
+    throw new Error(`${r.status} ${r.statusText}: ${txt}`);
+  }
   return r.json() as Promise<T>;
 }
 
@@ -75,6 +85,12 @@ export const api = {
   agent: (slot: number) => jget<AgentDetail>(`/api/agent/${slot}`),
   feedbackLog: (limit = 100) =>
     jget<FeedbackLogEntry[]>(`/api/feedback-log?limit=${limit}`),
+  // SPEC_L2_V3.0 — strains (菌株库)
+  listStrains: () => jget<StrainMeta[]>("/api/strains"),
+  saveStrain: (name: string, note = "") =>
+    jpost<StrainMeta>("/api/strains/save", { name, note }),
+  deleteStrain: (id: string) =>
+    jdel<{ removed: boolean; id: string }>(`/api/strains/${encodeURIComponent(id)}`),
 };
 
 export type SubscribeOpts = {

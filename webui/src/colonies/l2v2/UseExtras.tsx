@@ -13,7 +13,7 @@ import type { InferenceResponse } from "../../types";
  *   1. User picks instruction (AND / NOT) and bit values (0 / 1)
  *   2. Frontend translates → (f_a_hz, f_b_hz, f_s_hz) per oracle.py constants
  *   3. Backend runs the chosen agent(s) for ``duration_ms`` and returns f_out_hz
- *   4. Frontend classifies (f_out > 50 Hz ? 1 : 0), compares to expected bit,
+ *   4. Frontend classifies (f_out > OUT_SPIKING_THRESHOLD_HZ ? 1 : 0), compares to expected bit,
  *      and renders a verdict + expected vs actual + a plain-Chinese comment.
  *
  * One-shot mode: one question.
@@ -28,7 +28,10 @@ const LOGIC_LOW_HZ = 25.0;
 const LOGIC_HIGH_HZ = 75.0;
 const S_AND_HZ = 20.0;
 const S_NOT_HZ = 80.0;
-const OUT_SPIKING_THRESHOLD_HZ = 50.0;
+// v2.4 platform-cliff fix (oracle.py ERRATA v2.4): lowered 50→20 so the
+// near-spike cohort (~26-32 Hz on (1,1)) is correctly judged as '1'.
+// MUST match OUT_SPIKING_THRESHOLD_HZ in archaea/oracle.py.
+const OUT_SPIKING_THRESHOLD_HZ = 20.0;
 
 type Mode = "AND" | "NOT";
 type Bit = 0 | 1;
@@ -201,7 +204,8 @@ export function LogicTester() {
       <p className="text-xs text-amber-200/70 mb-3 leading-relaxed">
         点选下面的「指令 + 输入比特」，前端会自动翻译成三通道电平
         （A/B 用 25 Hz=0 / 75 Hz=1，S 用 20 Hz=AND / 80 Hz=NOT），
-        喂给当前种群里的目标 agent，再把它的输出 f_out 用 50 Hz 阈值翻译回 0/1。
+        喂给当前种群里的目标 agent，再把它的输出 f_out 用 {OUT_SPIKING_THRESHOLD_HZ} Hz 阈值翻译回 0/1
+        （v2.4：阈值由 50 Hz 下调到 20 Hz，让「快要会发声」的近阈个体也能被算作 1）。
       </p>
 
       {/* Sim health snapshot — surface g / t_sim / current pop accuracy so
@@ -264,8 +268,8 @@ export function LogicTester() {
       </div>
       {isHardNotPremium && (
         <div className="mb-3 px-3 py-1.5 text-[11px] text-rose-200/90 bg-rose-950/30 border border-rose-700/40 rounded leading-relaxed">
-          ⚠️ <b>高难溢价题 (ERRATA v2.1)</b>（reward=+25，全套最高）：输入电平很低（A=25Hz）却要求输出
-          <b> 反向激活 </b>到 50Hz 以上。这违反 SNN 的「输入越多 → 输出越多」直觉，
+          ⚠️ <b>高难溢价题 (ERRATA v2.3 + v2.4)</b>（reward=+25 + 加权采样占 NOT 题 50%）：输入电平很低（A=25Hz）却要求输出
+          <b> 反向激活 </b>到 {OUT_SPIKING_THRESHOLD_HZ}Hz 以上。这违反 SNN 的「输入越多 → 输出越多」直觉，
           需要演化出抑制路径。<b>新启动种群 99% 错</b>，f_out=0 是预期现象 — 但学会的精英能拿半个繁殖代价。
         </div>
       )}
@@ -312,7 +316,11 @@ export function LogicTester() {
 /**
  * Query target settings — picks WHICH agent(s) the LogicTester asks the
  * question to. SPEC §5.3 elite检测推荐 ensemble (top-K=10)，因为 best 单点
- * 容易卡在「AND 模式全 silent」的塌陷局部最优（acc_AND=75% 但 1 AND 1 必错）。
+ * 容易卡在「AND 模式全 silent」的塌陷局部最优（v2.2 acc_AND=75% 但 1 AND 1 必错；
+ * v2.3 加权采样后 silent 天花板已降到 50%，best 也更可靠）。
+ *
+ * UI 用 chip 按钮组而非 native <select>，因为 macOS 受控 select 在某些
+ * Electron / Safari 版本下 onChange 会丢事件，导致用户「点了 best 没反应」。
  */
 function QuerySettings({
   form,
@@ -325,6 +333,18 @@ function QuerySettings({
 }) {
   const { target, topK, swarmRadius, durationMs, warmupMs } = form;
   const swarmDisabled = !slimeOn;
+
+  const targetOptions: { value: QueryTarget; label: string; disabled?: boolean }[] = [
+    { value: "best", label: "best · fitness 最高" },
+    { value: "ensemble", label: "ensemble · top-K 平均" },
+    { value: "random", label: "random · 随机活体" },
+    { value: "swarm", label: `🍄 swarm${swarmDisabled ? "（需开黏菌）" : ""}`, disabled: swarmDisabled },
+  ];
+
+  const topKPresets = [1, 5, 10, 20, 50];
+  const swarmRadiusPresets = [1, 2, 3, 5, 8];
+  const durationPresets = [200, 500, 1000, 2000];
+
   return (
     <div className="rounded border border-amber-800/30 bg-slate-950/40 p-3 mb-3">
       <div className="flex items-baseline justify-between mb-2">
@@ -333,86 +353,154 @@ function QuerySettings({
         </div>
         <div className="text-[10px] text-amber-200/50">
           推荐 <code className="px-1 bg-slate-900 rounded">ensemble · top-K=10</code>
-          ，单 best 容易卡塌陷
         </div>
       </div>
-      <div className="grid grid-cols-2 md:grid-cols-5 gap-2 text-[11px]">
-        <div className="md:col-span-2">
-          <label className="block text-amber-200/70 mb-1">target</label>
-          <select
-            value={target}
-            onChange={(e) => setField("target", e.target.value as QueryTarget)}
-            className="qs-input w-full"
-          >
-            <option value="best">best · fitness 最高单个</option>
-            <option value="ensemble">ensemble · top-K 平均</option>
-            <option value="random">random · 随机活体</option>
-            <option value="swarm" disabled={swarmDisabled}>
-              🍄 swarm · 黏菌 hotspot{swarmDisabled ? "（需开启黏菌）" : ""}
-            </option>
-          </select>
-          <div className="text-[10px] text-slate-500 mt-1 leading-snug">
-            {target === "best" &&
-              "只问 fitness 最高那一个。fitness=mean(acc_AND, acc_NOT)，但塌陷个体也能拿高 fitness — 易误判。"}
-            {target === "ensemble" &&
-              `问 fitness 前 ${topK} 个 agent，输出取平均。能稀释单点塌陷，最稳的"看群体真实水平"方式。`}
-            {target === "random" && "随机活体——抽样看普通成员什么水平。"}
-            {target === "swarm" &&
-              (swarmDisabled
-                ? "需要在设置页勾选「赛博黏菌模式」并重启才能用。"
-                : `问信息素峰值格 ±${swarmRadius} 内的所有活体——共识最强子群。`)}
-          </div>
+
+      {/* Row 1: target chip bar — full width, prominent */}
+      <div className="mb-3">
+        <label className="block text-amber-200/70 text-[11px] mb-1.5">target</label>
+        <div className="flex flex-wrap gap-1.5">
+          {targetOptions.map((opt) => (
+            <ChipBtn
+              key={opt.value}
+              label={opt.label}
+              active={target === opt.value}
+              disabled={opt.disabled}
+              onClick={() => setField("target", opt.value)}
+            />
+          ))}
         </div>
-        <div>
-          <label className="block text-amber-200/70 mb-1">Top-K</label>
-          <input
-            type="number" min={1} max={50}
+        <div className="text-[10px] text-slate-500 mt-1.5 leading-snug min-h-[2.4em]">
+          {target === "best" &&
+            "只问 fitness 最高那一个。v2.3 加权后，silent 假精英会被天花板暴露，best 比 v2.2 时代靠谱很多。"}
+          {target === "ensemble" &&
+            `问 fitness 前 ${topK} 个 agent，输出取平均。最稳的"看群体真实水平"方式，对单点塌陷有抵抗力。`}
+          {target === "random" && "随机活体——抽样看普通成员什么水平（多半还在学习）。"}
+          {target === "swarm" &&
+            (swarmDisabled
+              ? "需要在设置页勾选「赛博黏菌模式」并重启才能用。"
+              : `问信息素峰值格 ±${swarmRadius} 内的所有活体——共识最强子群。`)}
+        </div>
+      </div>
+
+      {/* Row 2: per-target params — show only the relevant one */}
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mb-2">
+        {target === "ensemble" && (
+          <ChipRow
+            label="Top-K（合议人数）"
+            presets={topKPresets}
             value={topK}
-            disabled={target !== "ensemble"}
-            onChange={(e) => setField("topK", Math.max(1, Number(e.target.value) | 0))}
-            className="qs-input w-full disabled:opacity-40"
+            onPick={(v) => setField("topK", v)}
+            hint="参与平均的 fitness 排名前 K 个 agent。K 越大越稳但越被平庸稀释。"
           />
-          <div className="text-[10px] text-slate-500 mt-1">仅 ensemble</div>
-        </div>
-        <div>
-          <label className="block text-amber-200/70 mb-1">Swarm 半径</label>
-          <input
-            type="number" min={1} max={8}
+        )}
+        {target === "swarm" && !swarmDisabled && (
+          <ChipRow
+            label="Swarm 半径 ±R 格"
+            presets={swarmRadiusPresets}
             value={swarmRadius}
-            disabled={target !== "swarm"}
-            onChange={(e) => setField("swarmRadius", Math.max(1, Number(e.target.value) | 0))}
-            className="qs-input w-full disabled:opacity-40"
+            onPick={(v) => setField("swarmRadius", v)}
+            hint={`信息素 hotspot 周围 ${swarmRadius} 格内所有活体。R=1 共识最强。`}
           />
-          <div className="text-[10px] text-slate-500 mt-1">仅 swarm · ±R 格</div>
-        </div>
-        <div>
-          <label className="block text-amber-200/70 mb-1">duration_ms</label>
-          <input
-            type="number" min={50} max={5000} step={50}
-            value={durationMs}
-            onChange={(e) => setField("durationMs", Math.max(50, Number(e.target.value) | 0))}
-            className="qs-input w-full"
-          />
-          <div className="text-[10px] text-slate-500 mt-1">SPEC=500</div>
-        </div>
+        )}
+        <ChipRow
+          label="duration_ms（评估窗口）"
+          presets={durationPresets}
+          value={durationMs}
+          onPick={(v) => setField("durationMs", v)}
+          hint="SPEC §2 评估窗口=500ms。短窗口更快但波动大；长窗口更稳。"
+        />
       </div>
-      <details className="mt-2">
+
+      <details className="mt-1">
         <summary className="text-[10px] text-slate-500 cursor-pointer hover:text-slate-300 select-none">
           ▶ 高级：warmup_ms = {warmupMs}
         </summary>
-        <div className="mt-2">
-          <input
-            type="number" min={0} max={2000} step={10}
-            value={warmupMs}
-            onChange={(e) => setField("warmupMs", Math.max(0, Number(e.target.value) | 0))}
-            className="qs-input w-32"
-          />
+        <div className="mt-2 flex items-center gap-2">
+          {[0, 50, 100, 200, 500].map((w) => (
+            <ChipBtn
+              key={w}
+              label={`${w}ms`}
+              active={warmupMs === w}
+              onClick={() => setField("warmupMs", w)}
+              small
+            />
+          ))}
           <span className="text-[10px] text-slate-500 ml-2">
-            冷启动膜电位预热；训练时膜电位是连续的所以 warmup=0，推理时建议 ≥100ms。
+            冷启动膜电位预热；训练时连续，所以 0 即可，推理时建议 ≥100ms。
           </span>
         </div>
       </details>
-      <style>{`.qs-input{background:#020617;border:1px solid #475569;border-radius:4px;padding:4px 6px;font-family:ui-monospace,monospace;font-size:11px;color:#fde68a;}`}</style>
+    </div>
+  );
+}
+
+function ChipBtn({
+  label,
+  active,
+  onClick,
+  disabled,
+  small,
+}: {
+  label: string;
+  active: boolean;
+  onClick: () => void;
+  disabled?: boolean;
+  small?: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      className={clsx(
+        "rounded-md font-mono transition-colors border",
+        small ? "px-2 py-0.5 text-[10px]" : "px-3 py-1.5 text-[11px]",
+        active
+          ? "bg-amber-500 text-slate-950 font-semibold border-amber-400 shadow-sm shadow-amber-900/40"
+          : disabled
+            ? "bg-slate-900/40 text-slate-600 border-slate-800 cursor-not-allowed"
+            : "bg-slate-900/60 text-amber-200 border-slate-700 hover:border-amber-500 hover:bg-slate-800",
+      )}
+    >
+      {label}
+    </button>
+  );
+}
+
+function ChipRow({
+  label,
+  presets,
+  value,
+  onPick,
+  hint,
+}: {
+  label: string;
+  presets: number[];
+  value: number;
+  onPick: (v: number) => void;
+  hint: string;
+}) {
+  const isCustom = !presets.includes(value);
+  return (
+    <div>
+      <label className="block text-amber-200/70 text-[11px] mb-1">{label}</label>
+      <div className="flex flex-wrap gap-1.5 items-center">
+        {presets.map((p) => (
+          <ChipBtn
+            key={p}
+            label={p.toString()}
+            active={value === p}
+            onClick={() => onPick(p)}
+          />
+        ))}
+        {isCustom && (
+          <span className="px-2 py-0.5 text-[10px] rounded bg-amber-500/20 text-amber-200 font-mono border border-amber-500/40">
+            自定义={value}
+          </span>
+        )}
+      </div>
+      <div className="text-[10px] text-slate-500 mt-1 leading-snug">{hint}</div>
     </div>
   );
 }
@@ -504,7 +592,7 @@ function OneShotResult({ r }: { r: QuestionResult }) {
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm font-mono">
         <Cell label="种群输出 f_out" value={`${r.fOutHz.toFixed(1)} Hz`} accent="emerald" />
         <Cell
-          label="阈值翻译 (>50Hz=1)"
+          label={`阈值翻译 (>${OUT_SPIKING_THRESHOLD_HZ}Hz=1)`}
           value={r.outBit.toString()}
           accent={r.outBit ? "emerald" : "slate"}
         />
@@ -525,7 +613,7 @@ function OneShotResult({ r }: { r: QuestionResult }) {
 function oneShotComment(r: QuestionResult): string {
   if (r.correct) {
     if (r.mode === "NOT" && r.expected === 1) {
-      return `种群正确给出了「取反结果 = 1」的高难溢价答案 (NOT ${r.a} = 1)。这是 ERRATA v2.1 中奖励最丰厚 (+25 scaled) 的一类题。`;
+      return `种群正确给出了「取反结果 = 1」的高难溢价答案 (NOT ${r.a} = 1)。这是奖励最丰厚 (+25 scaled) 的一类题，v2.3 加权后还占 NOT 题的 50%。`;
     }
     if (r.mode === "AND" && r.expected === 1) {
       return `种群正确识别了「两个真才为真」的与门语义。`;
@@ -534,7 +622,7 @@ function oneShotComment(r: QuestionResult): string {
   }
   // wrong
   if (r.outBit === 1 && r.expected === 0) {
-    return `种群发声了 (f_out=${r.fOutHz.toFixed(0)}Hz > 50Hz)，但本题期望沉默。误激活——可能是 S 指令信号没被识别，或者抑制路径还没演化出来。`;
+    return `种群发声了 (f_out=${r.fOutHz.toFixed(0)}Hz > ${OUT_SPIKING_THRESHOLD_HZ}Hz)，但本题期望沉默。误激活——可能是 S 指令信号没被识别，或者抑制路径还没演化出来。`;
   }
   // 漏激活 — 区分完全死寂 vs 部分激活
   if (r.fOutHz <= 0.5) {
@@ -546,15 +634,16 @@ function oneShotComment(r: QuestionResult): string {
       `③ 这是 NOT(0)=1 高难题，对新种群本就是预期失败。`
     );
   }
-  if (r.fOutHz < 25) {
+  if (r.fOutHz < OUT_SPIKING_THRESHOLD_HZ * 0.5) {
     return (
-      `网络在低强度发放 (f_out=${r.fOutHz.toFixed(0)}Hz)，离 50Hz 阈值还远。` +
+      `网络在低强度发放 (f_out=${r.fOutHz.toFixed(0)}Hz)，离 ${OUT_SPIKING_THRESHOLD_HZ}Hz 阈值还远。` +
       `agent 的相关路径已经有微弱响应，但电流不足以稳定触发输出。` +
-      `提高 synapse_gain g（推荐 2~3）或继续演化通常能压过阈值。`
+      `v2.4 effort bonus 会给这种「方向对、强度不够」的尝试一点正向积分，` +
+      `继续演化或微调 g 通常能让它压过阈值。`
     );
   }
   return (
-    `网络在中强度发放 (f_out=${r.fOutHz.toFixed(0)}Hz)，但还差一点没过 50Hz。` +
+    `网络在中强度发放 (f_out=${r.fOutHz.toFixed(0)}Hz)，但还差一点没过 ${OUT_SPIKING_THRESHOLD_HZ}Hz。` +
     `离正确答案非常近——再演化几分钟、或者把 g 微调高一档，下次很可能就过了。`
   );
 }

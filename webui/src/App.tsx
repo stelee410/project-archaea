@@ -6,6 +6,7 @@ import { SetupPage } from "./pages/SetupPage";
 import { ObservePage } from "./pages/ObservePage";
 import { UsePage } from "./pages/UsePage";
 import { ColonyPicker } from "./pages/ColonyPicker";
+import { MixerPage } from "./pages/MixerPage";
 import { COLONIES, getColony } from "./colonies/registry";
 import type { ColonyMeta } from "./colonies/registry";
 import type { SimTask } from "./types";
@@ -14,7 +15,8 @@ type Tab = "setup" | "observe" | "use";
 
 type View =
   | { kind: "picker" }
-  | { kind: "colony"; colonyId: SimTask; tab: Tab };
+  | { kind: "colony"; colonyId: SimTask; tab: Tab }
+  | { kind: "mixer" };
 
 export default function App() {
   const [view, setView] = useState<View>({ kind: "picker" });
@@ -113,11 +115,28 @@ export default function App() {
     return () => window.removeEventListener("archaea:goto-colony", handler as EventListener);
   }, []);
 
+  // 「⚗️ Mixer」启动后会派发这个事件 → 自动跳到对应群落的观测页
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent<{ colonyId: SimTask }>).detail;
+      if (!detail?.colonyId) return;
+      const found = COLONIES.find((c) => c.id === detail.colonyId);
+      if (!found) return;
+      setView({ kind: "colony", colonyId: found.id, tab: "observe" });
+    };
+    window.addEventListener("archaea:mixer-launched", handler as EventListener);
+    return () => window.removeEventListener("archaea:mixer-launched", handler as EventListener);
+  }, []);
+
   function pickColony(c: ColonyMeta) {
     // 进入群落时的默认 tab：如果该群落正在跑就直接去观测，否则去设置
     const runningId = status?.running ? status.config?.task : null;
     const defaultTab: Tab = runningId === c.id ? "observe" : "setup";
     setView({ kind: "colony", colonyId: c.id, tab: defaultTab });
+  }
+
+  function pickMixer() {
+    setView({ kind: "mixer" });
   }
 
   function backToPicker() {
@@ -135,7 +154,7 @@ export default function App() {
     <div className="min-h-screen flex flex-col">
       <header className="border-b border-slate-800 bg-slate-900/70 backdrop-blur sticky top-0 z-10">
         <div className="max-w-[1400px] mx-auto px-6 py-3 flex items-center gap-4 flex-wrap">
-          {view.kind === "colony" && (
+          {view.kind !== "picker" && (
             <button
               onClick={backToPicker}
               className="px-2 py-1 rounded text-xs bg-slate-800 hover:bg-slate-700 text-slate-300"
@@ -155,7 +174,12 @@ export default function App() {
                 · {colony.emoji} {colony.name}
               </span>
             )}
-            {!colony && (
+            {view.kind === "mixer" && (
+              <span className="ml-3 text-sm text-slate-300 font-normal">
+                · ⚗️ Mixer · 杂交皿
+              </span>
+            )}
+            {view.kind === "picker" && (
               <span className="ml-2 text-xs text-slate-400 font-normal">· 群落图鉴</span>
             )}
           </button>
@@ -205,7 +229,10 @@ export default function App() {
         </div>
       </header>
       <main className="flex-1 min-h-0">
-        {view.kind === "picker" && <ColonyPicker onPick={pickColony} />}
+        {view.kind === "picker" && (
+          <ColonyPicker onPick={pickColony} onPickMixer={pickMixer} />
+        )}
+        {view.kind === "mixer" && <MixerPage />}
         {view.kind === "colony" && colony && view.tab === "setup" && (
           <SetupPage
             colony={colony}

@@ -5,6 +5,7 @@ import { COLONIES } from "../colonies/registry";
 
 interface Props {
   onPick: (colony: ColonyMeta) => void;
+  onPickMixer?: () => void;
 }
 
 /**
@@ -19,7 +20,7 @@ interface Props {
  *   ⚪ 当前 sim 未启动              → 「→ 进入培养皿」
  *   🔒 群落 locked                  → 显示「待解锁」+ unlockHint
  */
-export function ColonyPicker({ onPick }: Props) {
+export function ColonyPicker({ onPick, onPickMixer }: Props) {
   const status = useStore((s) => s.status);
   const runningTask = status?.running ? status.config?.task ?? null : null;
 
@@ -48,6 +49,7 @@ export function ColonyPicker({ onPick }: Props) {
             currentPopMax={status?.pop_max ?? 0}
           />
         ))}
+        <MixerCard onPick={onPickMixer} />
         <FuturePlaceholder />
       </div>
 
@@ -142,6 +144,50 @@ function DifficultyStars({ n }: { n: number }) {
       {"★".repeat(n)}
       <span className="text-slate-700">{"☆".repeat(5 - n)}</span>
     </div>
+  );
+}
+
+function MixerCard({ onPick }: { onPick?: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onPick}
+      disabled={!onPick}
+      className={clsx(
+        "group text-left rounded-xl border-2 p-6 transition-all",
+        "border-cyan-500/40 bg-cyan-950/20 hover:border-cyan-300 hover:bg-cyan-950/40",
+        !onPick && "opacity-50 cursor-not-allowed"
+      )}
+    >
+      <div className="flex items-start justify-between gap-3 mb-3">
+        <div className="flex items-baseline gap-3">
+          <span className="text-4xl">⚗️</span>
+          <div>
+            <div className="text-lg font-semibold text-cyan-100 leading-tight">
+              杂交皿 · Mixer
+            </div>
+            <div className="text-[11px] text-cyan-200/60 font-mono mt-0.5">
+              admixture · SPEC_L2_V3.0
+            </div>
+          </div>
+        </div>
+        <div className="text-xs font-mono text-cyan-300/70">实验台</div>
+      </div>
+
+      <p className="text-sm text-cyan-100/90 mb-4 leading-relaxed">
+        把两个已经养出的菌株（例：AND-学家 + NOT-学家）一起倒进新培养皿，
+        在前 N 秒放大 HGT，让基因水平转移诞生「双修」个体。
+      </p>
+
+      <div className="flex items-center justify-between">
+        <span className="text-xs text-cyan-300/70">
+          ⚙️ 用前先在某个群落里 💾 保存几个菌株
+        </span>
+        <span className="text-sm font-medium text-cyan-200 group-hover:translate-x-1 transition-transform">
+          → 进入实验台
+        </span>
+      </div>
+    </button>
   );
 }
 

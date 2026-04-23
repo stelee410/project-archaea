@@ -7,7 +7,7 @@ import { CALIBRATION_LAMBDA_STORAGE_KEY } from "../components/CalibrationLambdaS
 import { SYNAPSE_GAIN_STORAGE_KEY } from "../components/SynapseGainSlider";
 import type { ColonyMeta } from "../colonies/registry";
 import { COLONIES } from "../colonies/registry";
-import type { BudgetMode, SimConfig } from "../types";
+import type { BudgetMode, SimConfig, TaskDifficulty } from "../types";
 
 // Note: SimTask import previously used for the now-deleted `task` <select>;
 // removed because task is decided by the chosen Colony.
@@ -114,6 +114,7 @@ const BASE_DEFAULTS: SimConfig = {
   calibration_lambda: 0.0,
   synapse_gain: 1.0,
   task: "l1",
+  task_difficulty: "balanced",
 };
 
 export function SetupPage({ colony, onLaunched }: SetupPageProps) {
@@ -380,6 +381,13 @@ export function SetupPage({ colony, onLaunched }: SetupPageProps) {
         )}
       </div>
 
+      {colony.id === "l2v2_ctrl" && (
+        <DifficultyPanel
+          value={cfg.task_difficulty}
+          onChange={(v) => update("task_difficulty", v)}
+        />
+      )}
+
       <SlimePanel cfg={cfg} setCfg={setCfg} />
 
       <div className="mt-10 rounded-lg border border-slate-800 bg-slate-900/50 p-5 text-sm leading-relaxed text-slate-300">
@@ -639,6 +647,237 @@ function BoolField({ label, k, cfg, setCfg }: BoolFieldProps) {
         onChange={(e) => setCfg(k, e.target.checked as never)}
         className="h-4 w-4 accent-fuchsia-400"
       />
+    </div>
+  );
+}
+
+// ── L2v2 difficulty / environment-shaping panel ────────────────────────────
+
+interface DifficultyOption {
+  id: TaskDifficulty;
+  label: string;
+  pAndOne: number;
+  pNotOne: number;
+  silentCeiling: number;     // acc_AND a permanently-silent agent could reach
+  vibe: string;              // one-liner ecological description
+  warning?: string;
+}
+
+const DIFFICULTY_OPTIONS: DifficultyOption[] = [
+  {
+    id: "uniform",
+    label: "uniform — SPEC 原版",
+    pAndOne: 0.25,
+    pNotOne: 0.5,
+    silentCeiling: 0.75,
+    vibe: "1∧1=1 占 25%。「躺平 (always-silent)」可拿 75% AND 表面正确率 — 适合复现 SPEC v2.0 默认观感。",
+  },
+  {
+    id: "balanced",
+    label: "balanced — v2.3 推荐",
+    pAndOne: 0.5,
+    pNotOne: 0.5,
+    silentCeiling: 0.5,
+    vibe: "1∧1=1 占 50%。躺平上限被打回 50%，与瞎猜无异 — 仪表盘开始能照见真相。",
+  },
+  {
+    id: "hard",
+    label: "hard — 强压力",
+    pAndOne: 0.7,
+    pNotOne: 0.7,
+    silentCeiling: 0.3,
+    vibe: "1∧1=1 占 70%。沉默个体每窗都在亏损，演化节奏明显加快 — 但需要已有少量精英才不会崩。",
+    warning: "如果 acc_and_11_pop 仍为 0，建议先在 balanced 跑出火苗再切。",
+  },
+  {
+    id: "extreme",
+    label: "extreme — 实验室",
+    pAndOne: 0.9,
+    pNotOne: 0.9,
+    silentCeiling: 0.1,
+    vibe: "1∧1=1 占 90%。生态剧变 — 几乎只有真懂逻辑的个体能活；常用于「我已经有精英了，能不能稳住」的压力测试。",
+    warning: "founder 弱时 ≥80% 概率全员饿死。建议 pop_max ≥ 1000 + 已建立精英子种群。",
+  },
+];
+
+interface SpecialistOption {
+  id: TaskDifficulty;
+  label: string;
+  vibe: string;
+  warning?: string;
+}
+
+// SPEC_L2_V3.0 §2.4 — separate sub-group for "single-gate dishes".
+// Cleanly separated from the gradient above so the user understands these
+// don't sit on the difficulty axis — they switch the *task distribution*.
+const SPECIALIST_OPTIONS: SpecialistOption[] = [
+  {
+    id: "and_only",
+    label: "and_only — AND 学家培养皿",
+    vibe:
+      "100% 时间考 AND（P(AND)=1）。不再问 NOT，群体只能演化"
+      + "「两路同高 → 输出高」一种逻辑。用来养一锅纯 AND 学家菌株 → 💾 保存 → 倒进 ⚗️ Mixer。",
+    warning:
+      "保存出的菌株只会 AND；NOT 通路可能完全没发育（甚至被选择掉）。"
+      + "想要它真懂 NOT 必须再单独跑一锅 not_only。",
+  },
+  {
+    id: "not_only",
+    label: "not_only — NOT 学家培养皿",
+    vibe:
+      "100% 时间考 NOT（P(AND)=0）。所有题都是「输入低 → 输出高 / 输入高 → 输出低」，"
+      + "群体只能往抑制电路这一条路演化。用来养纯 NOT 学家菌株。",
+    warning:
+      "NOT 在生物上比 AND 更难涌现（需要抑制突触 + 选择器响应），"
+      + "founder 弱时容易卡 ~50% 一段时间。建议 synapse_gain ≥ 2.5、pop_max ≥ 1000、耐心 30 分钟+。",
+  },
+];
+
+function DifficultyPanel({
+  value,
+  onChange,
+}: {
+  value: TaskDifficulty;
+  onChange: (v: TaskDifficulty) => void;
+}) {
+  const current =
+    DIFFICULTY_OPTIONS.find((o) => o.id === value) ??
+    SPECIALIST_OPTIONS.find((o) => o.id === value) ??
+    DIFFICULTY_OPTIONS[1];
+  const isSpecialist = SPECIALIST_OPTIONS.some((o) => o.id === value);
+  return (
+    <div className="mt-8 rounded-lg border border-amber-700/40 bg-amber-950/10 p-5">
+      <div className="flex items-baseline gap-3 mb-2">
+        <span className="text-base font-semibold text-amber-100">
+          🎚️ 出题分布 — 塑造环境
+        </span>
+        <span className="text-[11px] text-amber-200/60 font-mono">
+          task_difficulty · 调采样比例 · 不动奖励规则
+        </span>
+      </div>
+      <p className="text-xs text-amber-200/80 leading-relaxed">
+        这里改的是<b>题目分布</b>（环境）而不是奖励表（规则）—
+        所以你是「上帝」不是「工程师」。
+      </p>
+
+      <div className="mt-4">
+        <div className="text-[11px] uppercase tracking-wider text-amber-200/60 mb-1.5">
+          ① 混合任务 — 同时考 AND + NOT，调难度梯度
+        </div>
+        <div className="grid grid-cols-2 lg:grid-cols-4 gap-2">
+          {DIFFICULTY_OPTIONS.map((opt) => {
+            const active = opt.id === value;
+            return (
+              <button
+                key={opt.id}
+                type="button"
+                onClick={() => onChange(opt.id)}
+                className={clsx(
+                  "text-left rounded border px-3 py-2 transition-colors",
+                  active
+                    ? "border-amber-400 bg-amber-500/15 text-amber-100"
+                    : "border-amber-800/40 bg-amber-950/20 text-amber-200/80 hover:bg-amber-900/30"
+                )}
+              >
+                <div className="text-xs font-semibold">{opt.label}</div>
+                <div className="mt-1 text-[10px] font-mono numeric text-amber-200/70">
+                  P(target=1|AND)={opt.pAndOne.toFixed(2)} · 躺平上限{" "}
+                  {(opt.silentCeiling * 100).toFixed(0)}%
+                </div>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
+      <div className="mt-4">
+        <div className="text-[11px] uppercase tracking-wider text-cyan-200/70 mb-1.5">
+          ② 单门培养皿 — ⚗️ 杂交皿专用，只考一种逻辑
+        </div>
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-2">
+          {SPECIALIST_OPTIONS.map((opt) => {
+            const active = opt.id === value;
+            return (
+              <button
+                key={opt.id}
+                type="button"
+                onClick={() => onChange(opt.id)}
+                className={clsx(
+                  "text-left rounded border px-3 py-2 transition-colors",
+                  active
+                    ? "border-cyan-400 bg-cyan-500/15 text-cyan-50"
+                    : "border-cyan-800/40 bg-cyan-950/20 text-cyan-200/80 hover:bg-cyan-900/30"
+                )}
+              >
+                <div className="text-xs font-semibold">{opt.label}</div>
+                <div className="mt-1 text-[10px] font-mono numeric text-cyan-200/70">
+                  P(AND) = {opt.id === "and_only" ? "1.00" : "0.00"} · 单一专家
+                </div>
+              </button>
+            );
+          })}
+        </div>
+        <div className="mt-2 text-[11px] text-cyan-200/70 leading-relaxed">
+          典型流程：先用 <code className="px-1 rounded bg-cyan-900/40">and_only</code> 跑出
+          AND 学家 → 观测页 💾 保存为菌株 →
+          换 <code className="px-1 rounded bg-cyan-900/40">not_only</code> + 新 seed 跑出 NOT
+          学家 → 💾 保存 → 回图鉴进 ⚗️ <b>Mixer</b> 把两个菌株倒在一起做杂交。
+        </div>
+      </div>
+
+      <div
+        className={clsx(
+          "mt-4 rounded border p-3",
+          isSpecialist
+            ? "border-cyan-800/40 bg-cyan-950/30"
+            : "border-amber-800/40 bg-amber-950/30"
+        )}
+      >
+        <div
+          className={clsx(
+            "text-xs leading-relaxed",
+            isSpecialist ? "text-cyan-100" : "text-amber-100"
+          )}
+        >
+          <b>当前选择：</b>
+          <span className={isSpecialist ? "text-cyan-200" : "text-amber-200"}>
+            {current.label}
+          </span>
+        </div>
+        <div
+          className={clsx(
+            "mt-1 text-[12px] italic leading-relaxed",
+            isSpecialist ? "text-cyan-100/80" : "text-amber-100/80"
+          )}
+        >
+          {current.vibe}
+        </div>
+        {current.warning && (
+          <div
+            className={clsx(
+              "mt-2 text-[11px] border-l-2 pl-2",
+              isSpecialist
+                ? "text-cyan-300/90 border-cyan-400/60"
+                : "text-amber-300/90 border-amber-400/60"
+            )}
+          >
+            ⚠ {current.warning}
+          </div>
+        )}
+      </div>
+
+      <details className="mt-3 text-xs text-amber-200/70">
+        <summary className="cursor-pointer text-amber-200/60 hover:text-amber-200">
+          为什么要给「上帝」一个滑块？
+        </summary>
+        <p className="mt-2 leading-relaxed">
+          奖励规则（reward table）一旦改动，原本的演化结果就不再可比 — 那是「换游戏」。
+          采样分布只是改了「这局牌发什么」 — 古菌还要靠自己进化的策略来活下来。
+          所以这个滑块的哲学是：让用户能塑造生态压力的<b>来源</b>，而不是干预演化的<b>过程</b>。
+          配合下方仪表盘的 <code className="px-1 rounded bg-amber-900/40">acc_and_11_pop</code>{" "}
+          指标，你能直接看到「沉默」与「真懂」的分界线。
+        </p>
+      </details>
     </div>
   );
 }

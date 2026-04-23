@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
 
 from .agent import N_HISTORY, fitness_with_calibration_penalty, pearson_r
@@ -40,25 +42,81 @@ from .slime import (
 )
 from .stimulus import draw_input_rate, poisson_spikes_window
 from .oracle import (
-    classify_output,
-    draw_oracle_sample,
-    poisson_three_channels,
+    DEFAULT_TASK_DIFFICULTY,
     MODE_AND,
     MODE_NOT,
+    classify_output,
+    difficulty_weights,
+    draw_oracle_sample,
+    poisson_three_channels,
+    spike_effort_bonus,
 )
 from .task import DEFAULT_TASK, TASK_L1, TASK_L2V2, is_logic_task, validate_task
 
 SIGMA_BASE = 0.3
 
-# L2v2 weight initialisation: SPEC §3.1 — inhibitory weights enabled.
-# Symmetric uniform around 0 already gives ~50% negative weights, well above
-# the SPEC's "≥20% negative" lower bound, so we don't need extra biasing.
-L2V2_WEIGHT_INIT_LOW = -1.5
+
+@dataclass
+class FounderInjection:
+    """SPEC_L2_V3.0 §1.3 — one entry in an admixture experiment's founder list.
+
+    ``weights`` is a (K, 220) pool (typically the full living snapshot of a
+    saved Strain).  ``fraction`` is the share of ``n_initial`` slots that
+    should be filled by sampling (with replacement) from this pool.
+    """
+
+    weights: np.ndarray  # (K, N_WEIGHTS) — source pool
+    fraction: float       # share of n_initial slots, in [0, 1]
+    label: str = ""       # purely informational (e.g. "AND-pure-30min")
+
+# L2v2 weight initialisation — ERRATA v2.5 ("prebiotic stage" founder bias)
+# ────────────────────────────────────────────────────────────────────────────
+# SPEC §3.1 only requires "≥20% negative weights" for inhibitory paths.
+# v2.0–v2.4 used symmetric Uniform(-1.5, 1.5) → E[Σw] = 0 → I_o ≈ 0 →
+# f_out ≈ 0 for *every* founder.  This makes the colony's evolvability
+# strictly zero on a fresh seed: silent agents can't reproduce (net credit
+# < 0), no reproduction means no mutation, no mutation means no escape from
+# silence — the entire evolutionary loop never starts.
+#
+# v2.5 introduces a positive offset on the initial range so a fraction of
+# founders (~30-40%) emit f_out > OUT_SPIKING_THRESHOLD_HZ on day-zero
+# stimuli.  Negative weights still cover ~25% of the range — well above
+# the SPEC §3.1 "≥20% negative" lower bound, so inhibitory paths remain
+# discoverable by mutation.
+#
+# Biological framing: this is *not* intelligent design — it's the standard
+# evo-devo move of starting an experiment from a *prebiotically-selected*
+# founder population (cf. Lenski's LTEE, which begins with a fully-formed
+# E. coli, not from random monomers).  We are asking the question
+# "can a population that already produces output evolve logic gates?",
+# not "can random matter abiogenesise neural computation?" — the latter
+# is the abiogenesis problem and not solvable in the time-scales this
+# colony runs at.  See docs/project-summary.md §L2.5 for the full rationale.
+L2V2_WEIGHT_INIT_LOW = -0.5
 L2V2_WEIGHT_INIT_HIGH = 1.5
 
 # Per-mode rolling correctness window (in 500 ms windows).  Smaller than
 # N_HISTORY because logic windows are noisy; 20 keeps the bar reactive.
 LOGIC_HISTORY = 20
+
+# Population-level row-specific accuracy ring buffer length, in windows.
+# Larger than LOGIC_HISTORY because each individual row only fires on a
+# fraction of windows (e.g. (1,1) fires P=p_and_target_one × p_mode_and ≈
+# 25% of windows in balanced mode).  200 windows ≈ 100 s wall-clock at 20 Hz
+# and gives ~50 (1,1) samples to average over.
+ROW_HISTORY = 200
+
+# Six row-specific buckets indexed in this order:
+#   0 = AND (0,0)   1 = AND (0,1)   2 = AND (1,0)   3 = AND (1,1)
+#   4 = NOT a=0     5 = NOT a=1
+N_ROW_BUCKETS = 6
+
+
+def _row_bucket(mode: int, bit_a: int, bit_b: int) -> int:
+    """Map (mode, a, b) → 0..5 row bucket index."""
+    if mode == MODE_AND:
+        return 2 * int(bit_a) + int(bit_b)         # 0..3 for (0,0)/(0,1)/(1,0)/(1,1)
+    return 4 + int(bit_a)                          # 4 for NOT a=0; 5 for NOT a=1
 
 
 def gini_coefficient(x: np.ndarray) -> float:
@@ -128,6 +186,18 @@ class Population:
         "_last_acc_not_pop",
         "_last_both_pass_pct",
         "_last_logic_diversity",
+        # L2v2 task-difficulty (environment shaping) + per-row population telemetry
+        "task_difficulty",
+        "_difficulty_weights",
+        "_row_buf_correct",
+        "_row_buf_total",
+        "_row_buf_idx",
+        "_row_buf_filled",
+        "_last_row_acc",
+        # SPEC_L2_V3.0 §1.4 — admixture window (HGT boost for the first N seconds)
+        "admixture_window_s",
+        "admixture_hgt_multiplier",
+        "_t_sim_seconds",
     )
 
     def __init__(
@@ -141,10 +211,19 @@ class Population:
         calibration_lambda: float = 0.0,
         synapse_gain: float = 1.0,
         task: str = DEFAULT_TASK,
+        task_difficulty: str = DEFAULT_TASK_DIFFICULTY,
+        founders: "list[FounderInjection] | None" = None,
+        admixture_window_s: float = 0.0,
+        admixture_hgt_multiplier: float = 1.0,
     ):
         self.pop_max = int(pop_max)
         self.rng = rng
         self.task = validate_task(task)
+        # Environment shaping (only used when task=l2v2_ctrl). Resolve the
+        # preset name *now* so any typo blows up at colony launch, not
+        # asynchronously inside the sim loop.
+        self.task_difficulty = str(task_difficulty)
+        self._difficulty_weights = difficulty_weights(self.task_difficulty)
         n0 = self.pop_max if n_initial is None else min(int(n_initial), self.pop_max)
         if budget_mode not in VALID_BUDGET_MODES:
             raise ValueError(
@@ -199,20 +278,44 @@ class Population:
         self._last_both_pass_pct: float = 0.0
         self._last_logic_diversity: float = 0.0
 
+        # Population-level row-specific accuracy ring buffers (one slot per row).
+        # Each window where row r fires contributes (n_correct_agents, n_alive_agents);
+        # the ring buffer keeps the last ROW_HISTORY *firings of that row* (not
+        # all windows) so each row gets ~equal smoothing regardless of weight.
+        self._row_buf_correct = np.zeros((N_ROW_BUCKETS, ROW_HISTORY), dtype=np.int32)
+        self._row_buf_total = np.zeros((N_ROW_BUCKETS, ROW_HISTORY), dtype=np.int32)
+        self._row_buf_idx = np.zeros(N_ROW_BUCKETS, dtype=np.int32)
+        self._row_buf_filled = np.zeros(N_ROW_BUCKETS, dtype=bool)
+        self._last_row_acc: list[float] = [0.0] * N_ROW_BUCKETS
+
+        # SPEC_L2_V3.0 §1.4 — admixture window state.
+        self.admixture_window_s = float(max(0.0, admixture_window_s))
+        self.admixture_hgt_multiplier = float(max(1.0, admixture_hgt_multiplier))
+        self._t_sim_seconds = 0.0
+
         if self.slime.enabled:
             init_xy = random_positions(self.rng, self.pop_max, self.slime.grid_size)
             self.positions[...] = init_xy
 
-        for i in range(n0):
-            self.spawn_initial_slot(i)
+        # SPEC_L2_V3.0 — admixture: if founders given, draw from those strains
+        # for the initial slots; remaining slots fall back to random init so the
+        # population stays evolvable even at a low fraction sum.
+        if founders:
+            self._spawn_initial_with_founders(n0, founders)
+        else:
+            for i in range(n0):
+                self.spawn_initial_slot(i)
 
     def _init_weights_for_task(self) -> np.ndarray:
         """Sample one fresh weight vector with the task-appropriate range.
 
         L1   : Uniform(-3, 3)        — SPEC §1.1.
-        L2v2 : Uniform(-1.5, 1.5)    — SPEC_L2_V2.0 §3.1 inhibitory weights
-                                       (symmetric => ~50% negative, satisfies
-                                       the SPEC's "≥20% negative" requirement).
+        L2v2 : Uniform(-0.5, 1.5)    — SPEC_L2_V2.0 §3.1 inhibitory weights
+                                       with v2.5 prebiotic-stage offset
+                                       (~25% negative, satisfies the SPEC's
+                                       "≥20% negative" requirement; positive
+                                       mean so founders are evolvable, see
+                                       L2V2_WEIGHT_INIT_LOW comment block).
         """
         if self.task == TASK_L2V2:
             return self.rng.uniform(
@@ -240,6 +343,61 @@ class Population:
         self.v_o[slot].fill(V_REST)
         self.ref_o[slot].fill(0)
         self._reset_logic_buffers_slot(slot)
+
+    def _spawn_initial_with_founders(
+        self,
+        n_initial: int,
+        founders: list[FounderInjection],
+    ) -> None:
+        """SPEC_L2_V3.0 §1.3 — admixture initial spawn.
+
+        Each founder claims ``round(fraction × n_initial)`` slots, filled by
+        sampling-with-replacement from its weight pool.  Any leftover slots
+        (from rounding or sum(fraction) < 1.0) fall back to task-default
+        random init — this keeps founder evolvability if the user only mixes
+        a small fraction of saved strains into a fresh sea.
+        """
+        # Validate fractions; reject obvious user-side mistakes loudly so the
+        # sim doesn't silently launch with zero founders from a typo'd payload.
+        for f in founders:
+            if f.weights.ndim != 2 or f.weights.shape[1] != N_WEIGHTS:
+                raise ValueError(
+                    f"founder {f.label!r}: weights must be (K, {N_WEIGHTS}), got {f.weights.shape}"
+                )
+            if f.weights.shape[0] == 0:
+                raise ValueError(f"founder {f.label!r} has zero agents")
+            if not 0.0 <= f.fraction <= 1.0:
+                raise ValueError(f"founder {f.label!r} fraction {f.fraction} not in [0, 1]")
+        total = sum(f.fraction for f in founders)
+        if total > 1.0 + 1e-9:
+            raise ValueError(f"founder fractions sum to {total:.3f} > 1.0")
+
+        # Allocate slot counts by integer share of n_initial.  We round so the
+        # *actual* counts are predictable for tests and never overflow n_initial.
+        counts = [int(round(f.fraction * n_initial)) for f in founders]
+        # Trim if rounding pushed us past n_initial.
+        while sum(counts) > n_initial:
+            j = int(np.argmax(counts))
+            counts[j] -= 1
+
+        slot = 0
+        for f, k in zip(founders, counts):
+            if k <= 0:
+                continue
+            picks = self.rng.integers(0, f.weights.shape[0], size=k)
+            for w in f.weights[picks]:
+                self.spawn_initial_slot(slot)
+                # Overwrite the freshly-randomised weights with the founder's.
+                # Everything else (credit=C_INIT, fresh membrane, empty buffers)
+                # is correct as-is — admixture deliberately discards the source
+                # culture's bookkeeping (it's a "spore state": just the genome).
+                self.weights[slot] = np.asarray(w, dtype=np.float64).copy()
+                slot += 1
+
+        # Fill remaining slots with task-default random init.
+        while slot < n_initial:
+            self.spawn_initial_slot(slot)
+            slot += 1
 
     def living_indices(self) -> np.ndarray:
         return np.flatnonzero(self.alive)
@@ -290,6 +448,44 @@ class Population:
     def _logic_fitness_slot(self, slot: int) -> float:
         """Mean accuracy across AND and NOT, in [0, 1]."""
         return 0.5 * (self._logic_acc_slot(slot, MODE_AND) + self._logic_acc_slot(slot, MODE_NOT))
+
+    def _record_row_window(
+        self, mode: int, bit_a: int, bit_b: int, n_correct: int, n_total: int
+    ) -> None:
+        """Population-level: record one window's (n_correct, n_total) on row (mode, a, b).
+
+        This is the data source for the "1∧1 真学会率" / "NOT 0 真学会率"
+        dashboard widgets — the only way to tell genuine learning apart
+        from the silent attractor.
+        """
+        if n_total <= 0:
+            return
+        b = _row_bucket(mode, bit_a, bit_b)
+        idx = int(self._row_buf_idx[b])
+        self._row_buf_correct[b, idx] = int(n_correct)
+        self._row_buf_total[b, idx] = int(n_total)
+        self._row_buf_idx[b] = (idx + 1) % ROW_HISTORY
+        if idx + 1 >= ROW_HISTORY:
+            self._row_buf_filled[b] = True
+
+    def _row_acc(self, mode: int, bit_a: int, bit_b: int) -> float:
+        """Mean per-window agent-fraction-correct on row (mode, a, b) over its ring."""
+        b = _row_bucket(mode, bit_a, bit_b)
+        if self._row_buf_filled[b]:
+            tot = int(self._row_buf_total[b].sum())
+            cor = int(self._row_buf_correct[b].sum())
+        else:
+            n = int(self._row_buf_idx[b])
+            if n == 0:
+                return 0.0
+            tot = int(self._row_buf_total[b, :n].sum())
+            cor = int(self._row_buf_correct[b, :n].sum())
+        return (cor / tot) if tot > 0 else 0.0
+
+    def _row_n_samples(self, mode: int, bit_a: int, bit_b: int) -> int:
+        """How many windows of row (mode, a, b) are in the ring (for UI confidence display)."""
+        b = _row_bucket(mode, bit_a, bit_b)
+        return int(ROW_HISTORY if self._row_buf_filled[b] else self._row_buf_idx[b])
 
     def _record_logic_window(self, slot: int, mode: int, correct: bool) -> None:
         if mode == MODE_AND:
@@ -401,7 +597,13 @@ class Population:
         """
         oracle = None
         if self.task == TASK_L2V2:
-            oracle = draw_oracle_sample(self.rng)
+            w = self._difficulty_weights
+            oracle = draw_oracle_sample(
+                self.rng,
+                p_mode_and=w["p_mode_and"],
+                p_and_target_one=w["p_and_target_one"],
+                p_not_target_one=w["p_not_target_one"],
+            )
             spikes = poisson_three_channels(
                 self.rng, oracle.f_a_hz, oracle.f_b_hz, oracle.f_s_hz, 500.0
             )
@@ -441,6 +643,15 @@ class Population:
                     n_correct += 1
                 else:
                     rewards[j] = oracle.reward_wrong
+                # ERRATA v2.4 (design "C"): add a small directionally-correct
+                # spike-effort bonus on top of the table reward.  This is the
+                # gradient that lets near-spike mutations (e.g. 16 Hz on a (1,1)
+                # window) pay slightly better than fully-silent ones — turning
+                # the platform-cliff fitness landscape into an upward slope.
+                # Kept additive (not multiplicative) and applied BEFORE the
+                # slime pheromone bonus so it doesn't get amplified into the
+                # reward distortion that previously broke the silent attractor.
+                rewards[j] += spike_effort_bonus(float(f_outs[j]), oracle.target_bit)
                 # also keep f_in/f_out history defined (zeros) for downstream code paths
                 self._record_window(slot, f_in, float(f_outs[j]))
             # Population-wide telemetry: consensus + accuracy
@@ -454,6 +665,15 @@ class Population:
             self._last_oracle = oracle
             self._last_consensus_bit = consensus_bit
             self._last_consensus_acc = consensus_acc
+
+            # Population-level per-row accuracy (the "真学会" gauge data).
+            # n_correct already counted above; record it against this window's
+            # specific (mode, a, b) row.
+            if n_alive > 0:
+                self._record_row_window(
+                    oracle.mode, oracle.bit_a, oracle.bit_b,
+                    n_correct=n_correct, n_total=n_alive,
+                )
 
             # Budget mode is intentionally a no-op for L2v2 — the reward table
             # is already the entire economy.  We still set a sentinel.
@@ -514,13 +734,24 @@ class Population:
             r_mean = 0.0
 
         # ── Slime: horizontal gene transfer (social, lateral learning) ──
+        # SPEC_L2_V3.0 §1.4: during the admixture window, boost hgt_prob ×N
+        # to model the brief gene-exchange burst when two cultures first meet.
+        in_admixture_window = (
+            self.admixture_window_s > 0.0
+            and self._t_sim_seconds < self.admixture_window_s
+        )
+        eff_hgt_prob = (
+            min(1.0, self.slime.hgt_prob * self.admixture_hgt_multiplier)
+            if in_admixture_window
+            else self.slime.hgt_prob
+        )
         hgt_count = 0
         hgt_pair_log: list[tuple[int, int]] = []
         if (
             self.slime.enabled
             and self.slime.hgt_enabled
             and n_alive >= 2
-            and self.slime.hgt_prob > 0.0
+            and eff_hgt_prob > 0.0
         ):
             pos_alive = self.positions[idx]
             cred_alive = self.credit[idx].copy()
@@ -530,7 +761,7 @@ class Population:
                 cred_alive,
                 self.slime.grid_size,
                 self.slime.hgt_radius,
-                self.slime.hgt_prob,
+                eff_hgt_prob,
                 self.slime.hgt_donor_ratio,
             )
             for r_local, d_local in pairs:
@@ -665,6 +896,22 @@ class Population:
             self._last_both_pass_pct = both_pass_pct
             self._last_logic_diversity = logic_diversity
 
+            # Cache row-specific accuracies for telemetry payload.
+            # Index order matches _row_bucket(): AND(0,0), AND(0,1), AND(1,0),
+            # AND(1,1), NOT(a=0), NOT(a=1).
+            self._last_row_acc = [
+                self._row_acc(MODE_AND, 0, 0),
+                self._row_acc(MODE_AND, 0, 1),
+                self._row_acc(MODE_AND, 1, 0),
+                self._row_acc(MODE_AND, 1, 1),
+                self._row_acc(MODE_NOT, 0, 0),  # b=0 sentinel; NOT bucket only depends on a
+                self._row_acc(MODE_NOT, 1, 0),
+            ]
+
+        # Advance the population's own t_sim clock — used by the admixture
+        # window check above.  Each window is 500 ms by SPEC §3.
+        self._t_sim_seconds += 0.5
+
         return {
             "f_in": f_in,
             "births": births,
@@ -708,6 +955,49 @@ class Population:
             "acc_not_pop": float(self._last_acc_not_pop) if self.task == TASK_L2V2 else 0.0,
             "both_pass_pct": float(self._last_both_pass_pct) if self.task == TASK_L2V2 else 0.0,
             "logic_diversity": float(self._last_logic_diversity) if self.task == TASK_L2V2 else 0.0,
+            # Row-specific accuracy & sample-count (the "真学会" telemetry).
+            # acc_and_11_pop is the headline gauge — silent agents are pinned at 0
+            # here even when混合 acc_and_pop sits at the silent ceiling (75%/50%).
+            "acc_and_11_pop": (
+                float(self._row_acc(MODE_AND, 1, 1)) if self.task == TASK_L2V2 else 0.0
+            ),
+            "acc_not_0_pop": (
+                float(self._row_acc(MODE_NOT, 0, 0)) if self.task == TASK_L2V2 else 0.0
+            ),
+            # All 6 rows + sample counts, for the detailed truth-table widget.
+            "row_acc": (
+                {
+                    "and_00": float(self._row_acc(MODE_AND, 0, 0)),
+                    "and_01": float(self._row_acc(MODE_AND, 0, 1)),
+                    "and_10": float(self._row_acc(MODE_AND, 1, 0)),
+                    "and_11": float(self._row_acc(MODE_AND, 1, 1)),
+                    "not_a0": float(self._row_acc(MODE_NOT, 0, 0)),
+                    "not_a1": float(self._row_acc(MODE_NOT, 1, 0)),
+                }
+                if self.task == TASK_L2V2
+                else None
+            ),
+            "row_n": (
+                {
+                    "and_00": int(self._row_n_samples(MODE_AND, 0, 0)),
+                    "and_01": int(self._row_n_samples(MODE_AND, 0, 1)),
+                    "and_10": int(self._row_n_samples(MODE_AND, 1, 0)),
+                    "and_11": int(self._row_n_samples(MODE_AND, 1, 1)),
+                    "not_a0": int(self._row_n_samples(MODE_NOT, 0, 0)),
+                    "not_a1": int(self._row_n_samples(MODE_NOT, 1, 0)),
+                }
+                if self.task == TASK_L2V2
+                else None
+            ),
+            "task_difficulty": (
+                str(self.task_difficulty) if self.task == TASK_L2V2 else None
+            ),
+            # SPEC_L2_V3.0 §1.4 — admixture window state (UI uses this to show
+            # a "杂交期 still active, t/T s remaining" indicator + boosted HGT).
+            "admixture_active": bool(in_admixture_window),
+            "admixture_window_s": float(self.admixture_window_s),
+            "admixture_hgt_multiplier": float(self.admixture_hgt_multiplier),
+            "eff_hgt_prob": float(eff_hgt_prob),
         }
 
     def weight_diversity_metric(self) -> float:

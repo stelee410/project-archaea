@@ -3,6 +3,17 @@ export type BudgetMode = "none" | "shared";
 // SPEC_L2_V2.0 — evolution task selector
 export type SimTask = "l1" | "l2v2_ctrl";
 
+// SPEC_L2_V2.0 §0 — environment-shaping presets ("塑造环境而不是改变规则").
+// Backend registry: archaea.oracle.TASK_DIFFICULTY_PRESETS — keep in sync.
+export type TaskDifficulty =
+  | "uniform"
+  | "balanced"
+  | "hard"
+  | "extreme"
+  // SPEC_L2_V3.0 §2.4 — single-gate specialist dishes for the admixture experiment
+  | "and_only"
+  | "not_only";
+
 export interface SimConfig {
   seed: number;
   pop_max: number;
@@ -25,6 +36,50 @@ export interface SimConfig {
   calibration_lambda: number;
   synapse_gain: number;
   task: SimTask;
+  // Environment-shaping difficulty (only used for l2v2_ctrl task).
+  task_difficulty: TaskDifficulty;
+  // SPEC_L2_V3.0 §1.3 — admixture experiment (杂交皿).
+  // When founders is non-empty, the initial slots are filled by sampling each
+  // strain's living gene pool with the given fraction (sum ≤ 1; remainder is
+  // random as usual). admixture_window_s > 0 boosts hgt_prob ×multiplier for
+  // the first N sim-seconds to model two cultures meeting in a fresh dish.
+  founders?: FounderSpec[] | null;
+  admixture_window_s?: number;
+  admixture_hgt_multiplier?: number;
+}
+
+// SPEC_L2_V3.0 §1.3 — one entry in the founders list.
+export interface FounderSpec {
+  strain_id: string;
+  fraction: number; // (0, 1]
+}
+
+// SPEC_L2_V3.0 §1.1 — saved population snapshot, the unit of admixture.
+export interface StrainMeta {
+  id: string;
+  name: string;
+  task: SimTask;
+  n_agents: number;
+  t_sim: number;
+  source_seed: number;
+  source_difficulty: TaskDifficulty | null;
+  acc_and_pop_at_save: number | null;
+  acc_not_pop_at_save: number | null;
+  fitness_mean: number;
+  fitness_max: number;
+  note: string;
+  created_at: string;
+  spec_version: string;
+}
+
+// 6-row truth-table accuracies — see archaea.population._row_bucket
+export interface RowAccuracies {
+  and_00: number;
+  and_01: number;
+  and_10: number;
+  and_11: number;
+  not_a0: number;
+  not_a1: number;
 }
 
 // SPEC_L2_V2.0 §2.2 — one window's stimulus + ground truth
@@ -82,6 +137,18 @@ export interface TelemetryEvent {
   acc_not_pop?: number;
   both_pass_pct?: number;
   logic_diversity?: number;
+  // v2.3.1 — row-specific (target=1) accuracies — the "真学会" gauges.
+  // Silent agents are pinned at 0 here even when混合 acc_and_pop sits at the silent ceiling.
+  acc_and_11_pop?: number;
+  acc_not_0_pop?: number;
+  row_acc?: RowAccuracies | null;
+  row_n?: RowAccuracies | null;
+  task_difficulty?: TaskDifficulty | null;
+  // SPEC_L2_V3.0 §1.3 — admixture telemetry.
+  admixture_active?: boolean;
+  admixture_window_s?: number;
+  admixture_hgt_multiplier?: number;
+  eff_hgt_prob?: number;
 }
 
 export interface HelloEvent {

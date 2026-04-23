@@ -29,9 +29,10 @@ from .oracle import (
     S_NOT_HZ,
     poisson_three_channels,
 )
-from .population import Population
+from .population import FounderInjection, Population
 from .slime import SlimeConfig
 from .stimulus import poisson_spikes_window
+from .strain import Strain, load_strain, save_strain_from_population
 from .task import DEFAULT_TASK, TASK_L1, TASK_L2V2, validate_task
 
 WINDOW_S = 0.5
@@ -69,6 +70,16 @@ class SimConfig:
     synapse_gain: float = 1.0
     # SPEC_L2_V2.0 — evolution task (L1 rate tracking vs L2v2 logic gating).
     task: str = DEFAULT_TASK
+    # SPEC_L2_V2.0 §0 environment shaping — only used for L2v2 task.
+    # See archaea.oracle.TASK_DIFFICULTY_PRESETS for the registry.
+    task_difficulty: str = "balanced"
+    # SPEC_L2_V3.0 — admixture experiment (杂交皿).  When founders is non-empty
+    # the initial slots are seeded by sampling from saved strains instead of
+    # random init; admixture_window_s + multiplier give a burst of HGT for the
+    # first N seconds to model two cultures meeting.
+    founders: list[dict] | None = None
+    admixture_window_s: float = 0.0
+    admixture_hgt_multiplier: float = 5.0
 
     def normalized(self) -> "SimConfig":
         return SimConfig(
@@ -92,6 +103,10 @@ class SimConfig:
             calibration_lambda=float(max(0.0, self.calibration_lambda)),
             synapse_gain=float(max(1e-3, self.synapse_gain)),
             task=validate_task(self.task),
+            task_difficulty=str(self.task_difficulty),
+            founders=(list(self.founders) if self.founders else None),
+            admixture_window_s=float(max(0.0, self.admixture_window_s)),
+            admixture_hgt_multiplier=float(max(1.0, self.admixture_hgt_multiplier)),
         )
 
     def to_slime_config(self) -> SlimeConfig:
@@ -204,6 +219,42 @@ class SimulationRuntime:
 
     def start(self, config: SimConfig) -> dict[str, Any]:
         cfg = config.normalized()
+        # SPEC_L2_V3.0 — load saved strains and validate task compatibility.
+        founder_injections: list[FounderInjection] = []
+        if cfg.founders:
+            for entry in cfg.founders:
+                strain_id = str(entry.get("strain_id", "")).strip()
+                fraction = float(entry.get("fraction", 0.0))
+                if not strain_id:
+                    raise ValueError("founder entry missing 'strain_id'")
+                if fraction <= 0.0:
+                    continue
+                strain: Strain = load_strain(strain_id)
+                if strain.meta.task != cfg.task:
+                    raise ValueError(
+                        f"founder {strain.meta.name!r} (id={strain_id}) "
+                        f"is from task {strain.meta.task!r} but you are launching "
+                        f"task {cfg.task!r}; cross-task admixture is not supported"
+                    )
+                founder_injections.append(
+                    FounderInjection(
+                        weights=strain.weights,
+                        fraction=fraction,
+                        label=f"{strain.meta.name}:{strain_id}",
+                    )
+                )
+
+        # When admixture window is requested but slime is off, auto-enable
+        # spatial + HGT (otherwise HGT cannot trigger).  Force the reward bonus
+        # OFF — v2.x debugging proved pheromone_bonus_k > 0 distorts L2v2 oracle
+        # rewards into a silent attractor (see project-summary.md §5.7).
+        slime_cfg = cfg.to_slime_config()
+        if cfg.admixture_window_s > 0.0 and founder_injections:
+            slime_cfg.enabled = True
+            slime_cfg.hgt_enabled = True
+            slime_cfg.pheromone_bonus_k = 0.0  # critical: keep reward clean
+            slime_cfg.validate()
+
         with self._lock:
             if self._is_running:
                 self._stop_locked()
@@ -215,10 +266,14 @@ class SimulationRuntime:
                 n_initial=cfg.n_initial,
                 carrying_capacity=cfg.carrying_capacity,
                 budget_mode=cfg.budget_mode,
-                slime=cfg.to_slime_config(),
+                slime=slime_cfg,
                 calibration_lambda=cfg.calibration_lambda,
                 synapse_gain=cfg.synapse_gain,
                 task=cfg.task,
+                task_difficulty=cfg.task_difficulty,
+                founders=(founder_injections or None),
+                admixture_window_s=cfg.admixture_window_s,
+                admixture_hgt_multiplier=cfg.admixture_hgt_multiplier,
             )
             self._t_sim = 0.0
             self._last_event = None
@@ -710,6 +765,46 @@ class SimulationRuntime:
         with self._lock:
             return list(self._feedback_log[-limit:])
 
+    # ── SPEC_L2_V3.0 — strain snapshot ─────────────────────────────────────
+
+    def snapshot_strain(self, *, name: str, note: str = "") -> dict[str, Any]:
+        """Snapshot the currently-living population as a new Strain on disk.
+
+        Returns the saved StrainMeta as a JSON-friendly dict.  Raises if no
+        sim is running or if zero living agents."""
+        with self._lock:
+            if self._pop is None or not self._is_running:
+                raise RuntimeError("simulation not running")
+            pop = self._pop
+            cfg = self._config
+            t_sim = float(self._t_sim)
+            last = self._last_event or {}
+
+        # Save outside the lock — np.savez_compressed may take ~ms on large pops.
+        meta = save_strain_from_population(
+            pop,
+            name=name,
+            note=note,
+            t_sim=t_sim,
+            source_seed=int(cfg.seed) if cfg else -1,
+            source_difficulty=(
+                str(cfg.task_difficulty)
+                if cfg and cfg.task == TASK_L2V2
+                else None
+            ),
+            acc_and_pop=(
+                float(last.get("acc_and_pop", 0.0))
+                if cfg and cfg.task == TASK_L2V2
+                else None
+            ),
+            acc_not_pop=(
+                float(last.get("acc_not_pop", 0.0))
+                if cfg and cfg.task == TASK_L2V2
+                else None
+            ),
+        )
+        return meta.to_dict()
+
     # ------------------------------------------------------------- main loop
 
     def _run_loop(self) -> None:
@@ -795,6 +890,17 @@ class SimulationRuntime:
                         "acc_not_pop": float(info.get("acc_not_pop", 0.0)),
                         "both_pass_pct": float(info.get("both_pass_pct", 0.0)),
                         "logic_diversity": float(info.get("logic_diversity", 0.0)),
+                        # v2.3 row-specific (target=1) accuracies — the "真学会" gauges
+                        "acc_and_11_pop": float(info.get("acc_and_11_pop", 0.0)),
+                        "acc_not_0_pop": float(info.get("acc_not_0_pop", 0.0)),
+                        "row_acc": info.get("row_acc"),
+                        "row_n": info.get("row_n"),
+                        "task_difficulty": info.get("task_difficulty"),
+                        # SPEC_L2_V3.0 — admixture window state
+                        "admixture_active": bool(info.get("admixture_active", False)),
+                        "admixture_window_s": float(info.get("admixture_window_s", 0.0)),
+                        "admixture_hgt_multiplier": float(info.get("admixture_hgt_multiplier", 1.0)),
+                        "eff_hgt_prob": float(info.get("eff_hgt_prob", 0.0)),
                     }
                     self._last_event = event
                     subs = list(self._subscribers)

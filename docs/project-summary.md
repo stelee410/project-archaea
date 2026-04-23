@@ -206,27 +206,84 @@ Project Archaea 的定位是 **AI-Life（人工生命）** + **Neuroevolution（
 - 完整的训练数据审计文档（`docs/training-data-audit.md`），证明项目内**确实没有任何训练数据**
 - 全部代码在 GitHub: https://github.com/stelee410/project-archaea
 
+### 5.7 L2v2: 双输入逻辑门（已落地）+ 设计演化日志
+
+L2v2 是 §6 路线图里"L2 双输入逻辑函数"的第一个实现，已经跑通。它把 SPEC v1.0 的单通道频率追随升级为**三通道（A / B / Selector）+ 真值表 oracle 评分**：
+
+- **输入**：三组泊松脉冲，A/B 用 25 Hz=0 / 75 Hz=1，Selector 用 20 Hz=AND / 80 Hz=NOT
+- **评分**：`oracle.py` 维护真值表，每窗对每只 agent 单独打分（不是 SPEC v1.0 的 Pearson r）
+- **奖励梯度**：v2.2 软着陆 + v2.3 加权采样 + v2.4 平台-悬崖修补 + v2.5 prebiotic-stage 偏置
+- **特异性仪表盘**：UI 直接显示 `acc_and_11`、`acc_not_a0` 等单行真值表准确率，把"看似学会其实在偷懒（silent attractor）"的种群一眼识别出来
+
+#### 关键设计决策：prebiotic-stage founder bias（v2.5）
+
+在 v2.4 部署后，新种子从 `Uniform(-1.5, 1.5)` 起步，所有 founder 的 `Σw ≈ 0 ⇒ I_o ≈ 0 ⇒ f_out = 0`。结果是：
+
+- 全 silent → 净 credit < 0 → 永远不繁殖 → 永远不突变 → 永远 silent → ~5 分钟饿死
+- **演化的"变异-选择-繁殖"循环根本启动不了**——这是 evolvability=0 问题，不是 fitness landscape 问题
+
+v2.5 把 L2v2 founder 分布改为 `Uniform(-0.5, 1.5)`：
+
+- 期望 Σw 为正，~30-40% 的 day-zero founder 直接能产生 spike
+- 负权重仍占 25%，超过 SPEC §3.1 的 ≥20% 下限，抑制路径仍可由突变发现
+- **不是 intelligent design**——没有改演化算法、没有改评分规则、没有 hardcode 任何"会答 AND"的权重，只是把"研究问题"从「random matter 能否 abiogenesis 出神经计算」（abiogenesis 问题，~10⁹ 年）调整为「已能输出信号的网络能否演化出逻辑门」（演化问题，可计算）
+- **学术先例**：Lenski 长期演化实验（LTEE）也是从一个完整的 E. coli 起步，不是从原子。我们做的事是同一性质的"prebiotic selection"
+
+详见 `archaea/population.py` 中 `L2V2_WEIGHT_INIT_LOW` 上方的注释块，以及 `archaea/oracle.py` 模块 docstring 的 ERRATA v2.2-v2.5 历史。
+
+### 5.8 SPEC_L2_V3.0：杂交皿（Admixture Mixer）
+
+L2v2 跑通后只剩一个顽固阻塞：**「偏科」陷阱**——在同一个培养皿里 AND 学得很顺（>90%），NOT 总是不出来（~50% 永远徘徊）。原因是 NOT 在生物意义上确实更难（需要抑制电路 + 选择器通道的 contextual gating），而种群一旦把 AND 学成"主业"就再也没有突变压力去碰 NOT。
+
+仿照微生物演化（Lenski + 大量自然界 HGT 实验），引入「杂交皿」实验范式。三个核心概念：
+
+- **菌株（Strain）** — 把"某个时刻的全部活体"冻存为可重用的快照，包含权重 + task / difficulty / acc 元数据。和 `champions.py` 的 top-K elites 不同：菌株存的是**全部基因池**（最多 pop_max），admixture 需要代表性而不是精英。
+- **杂交（Admixture）** — 启动新仿真时，从两个或多个已保存的菌株里按比例抽样填充初始 slot（剩下空槽走默认随机 init 当背景噪声）。
+- **杂交期（Admixture Window）** — 启动后前 N 秒仿真时间内，HGT 概率 × 倍率（典型 ×5–×10），模拟"两群古菌在新培养皿里相遇并大幅交换基因"的短促事件，结束后自动恢复基线。
+
+实验剧本：先在两个独立环境里养出 AND-学家、NOT-学家两个专家菌株，然后倒在一起 → 杂交期内 HGT 把"会 AND 的隐藏神经元"和"会 NOT 的隐藏神经元"组合到同一个 agent 上 → 自然涌现真正的「双修」个体。
+
+工程边界：
+
+- 杂交皿**不是新的演化任务**（task 仍是 L2v2_ctrl 等已注册任务），只是一种**初始化方式**——`Population.spawn_from_strains()` 替换默认随机 init
+- 启动时若启用 admixture window，会**自动开启 slime grid + HGT** 但**关闭信息素奖励 K=0**（避免破坏 oracle 真值表）
+- `task` 必须与所有 founder strain 一致，跨任务杂交直接拒绝（避免输入维度 / 评分规则错位）
+- 持久化：`checkpoints/strains/<id>.npz` + `<id>.json` sidecar；菌株库列表只读 JSON，不加载权重，所以瞬时
+
+API（详见 `SPEC_L2_V3.0_admixture.md`）：
+
+- `POST /api/strains/save` — 把当前活体冻存为菌株
+- `GET  /api/strains` — 菌株库列表（无须加载权重）
+- `DELETE /api/strains/{id}` — 删除菌株
+- `POST /api/start` 新增字段 `founders=[{strain_id, fraction}, ...]` + `admixture_window_s` + `admixture_hgt_multiplier`
+
+WebUI 入口：图鉴里新加一张 **⚗️ 杂交皿 · Mixer** 卡片 → MixerPage 列出菌株库、勾选 founder、调比例、设杂交期长度 → 启动后自动跳到对应群落的 observe 页围观。ObservePage 顶部新增 **🧪 菌株 / 杂交皿** 条：右侧的「💾 保存为菌株」弹窗一键冻存当前种群；杂交期内会显示一道脉冲徽章 + `eff_hgt_prob` 实时数字。
+
 ---
 
 ## 6. 未来演进方向
 
-### 近期（已经在路线图上）：L2 — 双输入逻辑函数
+### 近期路线图：L2 — 双输入逻辑函数
 
 把 input 从一组扩展为 **两组独立 channel**（比如 5+5 个 input neuron），让群体演化出：
 
-- `f_out ≈ AND(f_a, f_b)`：两路输入同时高才输出高
-- `f_out ≈ NOT(f_a)`：输出与输入反相
-- `f_out ≈ XOR(f_a, f_b)`：经典非线性可分性测试
+- `f_out ≈ AND(f_a, f_b)`：两路输入同时高才输出高 — **L2v2 已落地** ✓
+- `f_out ≈ NOT(f_a)`：输出与输入反相 — **L2v2 已落地** ✓
+- `f_out ≈ XOR(f_a, f_b)`：经典非线性可分性测试 — **推迟到 L2.5+**
+- `f_out ≈ OR(f_a, f_b)`：本可顺手做但被 §5.7 的奖励梯度调试占用了精力，同样推迟
+
+> **当前实现状态**：详见 §5.7 — L2v2 已实现 AND + NOT 两种逻辑门 +
+> Selector channel（指令通道）+ 真值表 oracle 评分；OR / XOR 留给 L2.5。
 
 **为什么这个台阶很重要**：L1 的频率追随其实是**线性相关**任务，单个隐藏神经元就能近似。AND/XOR 强迫群体演化出**真正的非线性**，是从"传感器"到"逻辑门"的跨越。如果 XOR 能演化出来，意味着 20 个隐藏神经元里至少能涌现出一个"协同激活"的小回路。
 
 工程上需要的改动很小：
 
-- 新 `stimulus.py` 函数：`poisson_two_channels(f_a, f_b)`
-- 新 fitness 函数：把 `pearson_r(f_in, f_out)` 改成 `pearson_r(target_logic(f_a, f_b), f_out)`
-- WebUI Sweep 卡片增加 2D heatmap 模式（`f_a` × `f_b` → `f_out`）
+- 新 `stimulus.py` 函数：`poisson_two_channels(f_a, f_b)` ✓ (实际是 `poisson_three_channels`，多了 Selector)
+- 新 fitness 函数：把 `pearson_r(f_in, f_out)` 改成真值表评分 ✓ (`oracle.py::OracleSample`)
+- WebUI Sweep 卡片增加 2D heatmap 模式（`f_a` × `f_b` → `f_out`）— 推迟，L2v2 用了更直接的"逻辑测试器"代替
 
-预计是一个 weekend project。
+预计是一个 weekend project。**实际花了远超 weekend** 的时间——大头不在工程，在调出"silent attractor → platform-cliff → founder-collapse"系列演化生态学陷阱（见 §5.7 设计演化日志）。
 
 ### 远期路线图（按抽象层级递进）
 
