@@ -5,6 +5,116 @@ All agents in the population receive the same stimulus triple per window;
 each agent is then judged independently against the truth table.
 
 ──────────────────────────────────────────────────────────────────────────
+ERRATA v3.2 — Specialist-dish silent attractor: wrong-answer penalty
+──────────────────────────────────────────────────────────────────────────
+v3.1 enabled specialist cultivation but real runs of `not_only` still
+collapsed into a 100%-silent population (700 alive / 0 deaths after
+40+ minutes; (a=0, target=1) row stayed at 0%).  Diagnosis:
+
+The v2.2 reward table was tuned for the *mixed* dish — it deliberately
+keeps silent's expected income just above breath ("soft anti-collapse")
+so a fresh population doesn't go extinct before AND/NOT learners emerge.
+In `not_only` that arithmetic flips into a death trap for evolution:
+
+    silent net /win = 0.5 × (R_NOT_SILENT × scale + effort − BREATH)
+                    + 0.5 × (0 + 0 − BREATH)
+                    = 0.5 × (2.5 + 0.1 − 1.25) + 0.5 × (−1.25)
+                    = +0.05/win  ← silent is profitable
+
+silent agents never starve → no metabolic selection pressure → mutants
+that try to spike on (a=0, target=1) die from "spike on a=1, wrong"
+windows about as fast as they reproduce → NOT logic cannot emerge.
+
+Fix: in specialist dishes only (and_only / not_only), set
+``reward_wrong = -BREATH_PER_WINDOW = -1.25``.  This makes wrong answers
+exactly cancel one window's metabolic cost — so silent_on_wrong becomes
+−2.5/win, dragging silent's per-window net to:
+
+    not_only silent net = (−2.5 + 1.35) / 2 = −0.575/win
+                          → starves in ~87 windows (44 s)
+    not_only always-spike net = (+23.85 + −2.5) / 2 = +10.675/win
+                          → still viable (excitatory founders survive)
+    not_only smart NOT net = (+23.85 + 1.35) / 2 = +12.6/win
+                          → 18% reproduction-speed advantage over
+                            always-spike  → genuine selection forms
+
+Mixed dishes keep ``reward_wrong = 0`` — the v2.2 anti-collapse contract
+holds (silent net hovers near zero across uniform/balanced/hard/extreme,
+within ±0.5 breath; specialist silent is decisively below by ≥0.4 credit/
+win, the gap the v3.2 regression test pins).
+
+Implementation: ``TASK_DIFFICULTY_PRESETS`` grew a fourth field
+``reward_wrong``; ``draw_oracle_sample`` accepts it as a kwarg;
+``Population.step_window`` reads it from the difficulty preset and
+threads it through.  See docs/project-summary.md §5.10.
+
+──────────────────────────────────────────────────────────────────────────
+ERRATA v3.1 — Specialist-dish fixes (admixture cultivation prerequisites)
+──────────────────────────────────────────────────────────────────────────
+Two bugs only show up in the and_only / not_only specialist dishes added
+for the SPEC_L2_V3.0 admixture mixer:
+
+    (A) ``Population._fitness_defined`` required samples in BOTH the AND
+        buffer and the NOT buffer.  In a specialist dish one of them is
+        permanently empty, so every agent stayed "fitness undefined" for
+        the entire run — global_sigma never annealed (locked at SIGMA_BASE)
+        and elite-victim selection degraded to credit-only.  Fixed by
+        deriving _needs_and_samples / _needs_not_samples from the difficulty
+        preset's p_mode_and and gating fitness on only the modes the
+        environment actually produces.
+
+    (B) The v2.5 founder distribution Uniform(-0.5, +1.5) is excitation-
+        biased so day-zero founders emit some output.  This is anti-
+        aligned with NOT logic, so v3.1 had not_only mirror it to
+        Uniform(-1.5, +0.5).  **SUPERSEDED in v3.3**: that mirror, paired
+        with v3.2's silent-agent starvation penalty, killed the entire
+        founder population in the first few windows (uniformly inhibitory
+        weights ⇒ silent ⇒ starve before they can reproduce).  v3.3
+        replaces (B) with a structural anti-follower seed (Path D1); see
+        the v3.3 block below.
+
+The (A) fix from v3.1 stays.  Mixed dishes (uniform / balanced / hard /
+extreme) and the and_only dish keep the v2.5 excitatory founders and the
+"both modes required" fitness contract.  See docs/project-summary.md §5.9.
+
+──────────────────────────────────────────────────────────────────────────
+ERRATA v3.3 — Path D1: anti-follower structural seed for not_only
+──────────────────────────────────────────────────────────────────────────
+v3.1's "uniformly-inhibitory founder" was a misdiagnosis.  NOT logic
+isn't "negative weights everywhere"; it's *context-gated routing* —
+"A high → suppress output, A low → let a tonic source fire output".
+A Uniform(-1.5, +0.5) prior makes every founder silent (E[Σw·s] < 0 ⇒
+I_o below threshold) and v3.2's wrong-answer penalty starves them before
+mutation can stumble onto the routing topology.  Diagnosis: random or
+uniformly-inhibitory founders cannot find a context-gated micro-circuit
+inside the time-budget the colony runs at; the search space is too large.
+
+v3.3 replaces noise with structure.  Each not_only founder is born with
+a hand-designed anti-follower micro-circuit:
+
+    Hidden split into two functional groups:
+      A-detectors (cols 0..H_A_DET-1):
+          A→hidden  : strong positive  → tracks A channel
+          hidden→out: strong NEGATIVE  → A high suppresses output
+      S-tonic drivers (cols H_A_DET..N_HIDDEN-1):
+          S→hidden  : positive         → S=80Hz keeps these firing
+          hidden→out: positive         → drives output unless suppressed
+
+Behaviour at S=80Hz (NOT mode):
+    a=1 (75Hz) → A-detectors fire   → suppress output  → silent  ✓
+    a=0 (25Hz) → A-detectors quiet  → S-tonic drives   → spike   ✓
+
+Each founder draws independent noise within the structural bands so
+mutation+selection still operates on real variation; what's removed is
+the *abiogenesis* burden of inventing the routing pattern from random
+weights.  Biological precedent: GABAergic neurons evolved from
+glutamatergic ancestors via single postsynaptic ion-channel polarity
+flip; ON/OFF retinal ganglion cells share architecture but differ at
+one synapse's polarity.  The constants live in archaea/population.py
+near ``L2V2_NOT_SEED_*``; full rationale in
+docs/project-summary.md §5.11.
+
+──────────────────────────────────────────────────────────────────────────
 ERRATA v2.5 — Prebiotic-stage founder bias (companion to v2.4)
 ──────────────────────────────────────────────────────────────────────────
 Diagnosis after deploying v2.4 to a fresh seed: the colony died at
@@ -199,6 +309,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from .economy import BREATH_PER_WINDOW
 from .neuron import N_INPUT
 from .stimulus import poisson_spikes_window
 from .task import N_CH_A, N_CH_B, N_CH_S
@@ -290,14 +401,40 @@ P_NOT_TARGET_ONE = 0.5                 # P(A=0     | NOT)
 #
 # Within each specialist, target=1 sampling is held at 50% so the silent
 # attractor stays at the v2.3 ceiling (50%) — same as `balanced`.
+#
+# ERRATA v3.2 — wrong-answer penalty in specialist dishes.
+# ───────────────────────────────────────────────────────────
+# v2.2's reward table was tuned for the *mixed* dish: silent earns
+# +0.125/win across AND+NOT (just above breath, "soft anti-collapse").
+# In `not_only` that arithmetic flips: silent on (a=1, target=0) gets
+# R_NOT_SILENT × 0.25 = 2.5 → +1.35/win, but silent on (a=0, target=1)
+# only loses −1.25/win (breath only — reward_wrong=0).  Mean = +0.05/win,
+# which is metabolically *positive* — silent agents never starve, so no
+# selection pressure ever forms and NOT logic cannot emerge.  Diagnostic
+# symptom: 700 alive / 0 deaths / 0% on the (a=0, target=1) row after
+# 40+ minutes of `not_only` simulation.
+#
+# Fix: in specialist dishes, set reward_wrong = -BREATH_PER_WINDOW so
+# wrong answers exactly cancel one window's metabolic cost.  Then:
+#   not_only silent net = (−2.5 + 1.35) / 2 = −0.575/win  → dies in ~87
+#                                                          windows (44 s)
+#   not_only always-spike net = (+23.85 + −2.5) / 2 = +10.675/win  → lives
+#   not_only smart NOT net    = (+23.85 + 1.35) / 2 = +12.6/win    → 18%
+#       reproduction-speed advantage over always-spike → genuine selection
+#
+# Mixed dishes keep reward_wrong=0 (the v2.2 invariant: silent must remain
+# barely viable in mixed environments so the population doesn't go extinct
+# before the first AND-or-NOT learner emerges).
 TASK_DIFFICULTY_PRESETS: dict[str, dict[str, float]] = {
-    "uniform":  {"p_mode_and": 0.5, "p_and_target_one": 0.25, "p_not_target_one": 0.5},
-    "balanced": {"p_mode_and": 0.5, "p_and_target_one": 0.50, "p_not_target_one": 0.5},
-    "hard":     {"p_mode_and": 0.5, "p_and_target_one": 0.70, "p_not_target_one": 0.7},
-    "extreme":  {"p_mode_and": 0.5, "p_and_target_one": 0.90, "p_not_target_one": 0.9},
-    # SPEC_L2_V3.0 specialist dishes
-    "and_only": {"p_mode_and": 1.0, "p_and_target_one": 0.50, "p_not_target_one": 0.5},
-    "not_only": {"p_mode_and": 0.0, "p_and_target_one": 0.50, "p_not_target_one": 0.5},
+    "uniform":  {"p_mode_and": 0.5, "p_and_target_one": 0.25, "p_not_target_one": 0.5, "reward_wrong": 0.0},
+    "balanced": {"p_mode_and": 0.5, "p_and_target_one": 0.50, "p_not_target_one": 0.5, "reward_wrong": 0.0},
+    "hard":     {"p_mode_and": 0.5, "p_and_target_one": 0.70, "p_not_target_one": 0.7, "reward_wrong": 0.0},
+    "extreme":  {"p_mode_and": 0.5, "p_and_target_one": 0.90, "p_not_target_one": 0.9, "reward_wrong": 0.0},
+    # SPEC_L2_V3.0 specialist dishes — wrong-answer penalty turns the silent
+    # attractor from "free retirement" into "starve in 44 s" so selection
+    # pressure for true logic actually forms.  See ERRATA v3.2 above.
+    "and_only": {"p_mode_and": 1.0, "p_and_target_one": 0.50, "p_not_target_one": 0.5, "reward_wrong": -BREATH_PER_WINDOW},
+    "not_only": {"p_mode_and": 0.0, "p_and_target_one": 0.50, "p_not_target_one": 0.5, "reward_wrong": -BREATH_PER_WINDOW},
 }
 DEFAULT_TASK_DIFFICULTY = "balanced"
 
@@ -355,6 +492,7 @@ def draw_oracle_sample(
     p_mode_and: float | None = None,
     p_and_target_one: float | None = None,
     p_not_target_one: float | None = None,
+    reward_wrong: float = 0.0,
 ) -> OracleSample:
     """Draw one 500 ms stimulus triple and the matching ground truth.
 
@@ -371,6 +509,13 @@ def draw_oracle_sample(
     SPEC §0 difficulty preset).  Higher p_*_target_one ⇒ lazy "always
     silent" strategy is exposed faster, but the population must adapt
     or starve.  This is the design space behind the difficulty slider.
+
+    ``reward_wrong`` (ERRATA v3.2): credit awarded when the agent's
+    classification is wrong.  Defaults to 0 (the v2.2 mixed-dish
+    invariant — wrong answers cost only breath, no extra punishment, so
+    new agents have time to learn).  Specialist dishes pass
+    ``-BREATH_PER_WINDOW`` to cancel the silent-correct windfall and
+    force selection pressure to form.
     """
     p_m_and = P_MODE_AND if p_mode_and is None else float(p_mode_and)
     p_a1 = P_AND_TARGET_ONE if p_and_target_one is None else float(p_and_target_one)
@@ -406,7 +551,7 @@ def draw_oracle_sample(
         f_s_hz=f_s,
         target_bit=target_bit,
         reward_correct=rwd,
-        reward_wrong=0.0,
+        reward_wrong=float(reward_wrong),
     )
 
 

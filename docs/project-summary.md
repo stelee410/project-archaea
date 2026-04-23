@@ -259,6 +259,112 @@ API（详见 `SPEC_L2_V3.0_admixture.md`）：
 
 WebUI 入口：图鉴里新加一张 **⚗️ 杂交皿 · Mixer** 卡片 → MixerPage 列出菌株库、勾选 founder、调比例、设杂交期长度 → 启动后自动跳到对应群落的 observe 页围观。ObservePage 顶部新增 **🧪 菌株 / 杂交皿** 条：右侧的「💾 保存为菌株」弹窗一键冻存当前种群；杂交期内会显示一道脉冲徽章 + `eff_hgt_prob` 实时数字。
 
+### 5.9 ERRATA v3.1：专家培养皿的两个隐性 bug（A + B 修订）
+
+把 `and_only` / `not_only` 两个**单门培养皿**接到 SetupPage 之后，第一次实测就发现 NOT 培养皿表现极差（35 min 跑完 acc_NOT ≈ 34%，**比随机还差**），而 AND 培养皿轻松 91%。复盘发现两个相互独立、但都只在 specialist 模式下才显形的旧 bug：
+
+**Bug A — `_fitness_defined` 的合取条件在 specialist 下永远 False**
+
+`Population._fitness_defined()` 在 L2v2 里一直要求 `_acc_and_n[slot] > 0 AND _acc_not_n[slot] > 0`——这是 v2.0 时代故意加的守卫，避免新生 agent 只看过 AND 窗口就被当作"也会 NOT"。但在 `and_only` (`p_mode_and=1.0`) 或 `not_only` (`p_mode_and=0.0`) 里，另一边的 `_acc_n` 永远为 0，于是**整个种群一辈子都是 fitness undefined**，连锁后果：
+
+- `global_sigma()` 取不到任何有效个体的 fitness → `mean_f=0` → sigma 永远卡在 `SIGMA_BASE=0.3` 顶格，**突变退火失效**
+- `_pick_replacement_victim` 把所有 agent 的 fitness 当 `-1e300` → 退化成只看 credit 的胜者，**精英保护失灵**
+- 冻存的菌株元数据里 `fitness_mean / fitness_max` 全是 0，菌株库看上去像是"没学到任何东西"
+
+修法：从 `task_difficulty` 派生两个常量 `_needs_and_samples` / `_needs_not_samples`，`_fitness_defined` 只要求"环境会出现的模式"都至少有 1 个样本即可。同时把 `_logic_fitness_slot` 也改成只对**实际出现过的模式**取均值——否则一个完美 NOT-学家上限是 0.5，sigma 退火的动态范围被压扁一半。混合培养皿（balanced/uniform/...）的旧契约不变，回归测试已固化。
+
+**Bug B — `not_only` 缺一个"抑制端 prebiotic stage"**
+
+v2.5 把 founder 权重范围从 `Uniform(-1.5, +1.5)` 改成 `Uniform(-0.5, +1.5)`（兴奋性偏置 E[w]=+0.5），让 founder 当天就能输出脉冲、点火 evolvability——这是混合 / and_only 培养皿的救命符。但**这个偏置对 NOT 是反向的**：NOT 要求"a=1 时静默"，兴奋性 founder 离 NOT 解的距离是任意一支的最远端，靠 +1.3/win 的微弱选择压力把抑制电路从零突变出来不现实（这正是实测 acc_NOT < 50% 的根因）。
+
+修法：仅对 `not_only` 培养皿启用**镜像分布** `Uniform(-1.5, +0.5)`（E[w]=-0.5；约 25% 仍为正，留给突变发现兴奋性路径用）。生物对齐："prebiotic selection" 的同一招——既然我们研究"已具备某种倾向的 founder 能否演化出特定逻辑"，那么 NOT 培养皿就应该从已经倾向于抑制的种子开始，而不是要求兴奋性 founder 自己**先**反转再**再**学逻辑。代码：5 行新常量 `L2V2_WEIGHT_INIT_LOW_INHIB / HIGH_INHIB` + `_init_weights_for_task` 里加一个 `if self.task_difficulty == "not_only"` 分支。
+
+两个改动加起来 ~30 行 + 6 个回归测试（覆盖 specialist 各自的 fitness 收敛、sigma 退火、混合皿契约不破坏、两个新权重分布的均值/负权占比）。
+
+### 5.10 ERRATA v3.2：not_only 的 silent attractor 仍然存在 — 加 wrong-answer penalty
+
+实测 v3.1 之后，`not_only` 跑了 43 分钟仍然是 100% silent 种群（仪表盘：存活 700 / 累计死亡 0 / NOT 0=1 命中率 0%）。复盘发现 v3.1 的 fitness 退火和抑制 founder 都解决了，但**根因不在那里**——根因在 v2.2 奖励表本身和 specialist 培养皿的化学反应。
+
+**Silent 在 not_only 里是赚钱的策略**。代入 v2.2 数字（`R_NOT_SILENT_RAW=10` → scaled 2.5）算 silent agent 的每窗口净收益：
+
+| 窗口类型 | 概率 | reward | 净收益 |
+|---|---|---|---|
+| `target=0` (a=1, silent 答对) | 50% | 2.5 + 0.1 effort − 1.25 breath | **+1.35** |
+| `target=1` (a=0, silent 答错) | 50% | 0 + 0 − 1.25 breath | **−1.25** |
+| 平均 |  |  | **+0.05 / 窗口** |
+
+Silent 净收益是**正数**——agent 永远不会饿死，没有自然选择压力，整个种群被锁死在 silent attractor。和 `and_only` 的对照特别说明问题：`R_AND_SILENT_RAW=8`（scaled 2.0）下，AND 培养皿的 silent 净收益是 **−0.20/win**，自然就饿死了，所以 `and_only` 演化得动。NOT 之所以涌现不出来，是因为 v2.2 当年把 `R_NOT_SILENT` 调高了（10 vs 8）以保证 NOT 模式在混合皿里能有足够的 silent 收入"凑数"——这个为混合皿设计的安全垫，搬到 NOT 单门皿里就成了evolution killer。
+
+**修法**：在 specialist 培养皿里把 `reward_wrong` 从 0 改成 **−BREATH_PER_WINDOW = −1.25**（scaled credit）。这等价于"答错的窗口正好抵消一次代谢成本"。混合皿不动（保持 v2.2 的"silent 勉强糊口"契约——避免新种群在第一个学家涌现前集体灭绝）。
+
+代入新数字（not_only）：
+
+| 策略 | 净收益 / 窗口 | 含义 |
+|---|---|---|
+| Silent | (−2.5 + 1.35) / 2 = **−0.575** | 87 窗口 (≈44s) 饿死 |
+| Always-spike | (+23.85 + −2.5) / 2 = **+10.675** | 仍然繁荣（兴奋性 founder 不会初代灭绝）|
+| Smart NOT | (+23.85 + 1.35) / 2 = **+12.6** | 比 always-spike 快 **18%** 繁殖 |
+
+Silent 终于死掉，自然选择恢复；always-spike 活但不是最优，给 smart NOT 留出明确的繁殖速度优势。
+
+工程足迹很小：
+- `TASK_DIFFICULTY_PRESETS` 加第四个字段 `reward_wrong`（混合皿全部 0；`and_only` / `not_only` 都是 `−BREATH_PER_WINDOW`）
+- `draw_oracle_sample` 新增 `reward_wrong` 关键字（默认 0），写入 `OracleSample.reward_wrong`
+- `Population.step_window` 用 `_difficulty_weights.get("reward_wrong", 0.0)` 提取后传给 oracle
+- 4 个新回归测试（specialist preset 携带 `−BREATH`、`OracleSample.reward_wrong` 正确传播、4 种策略期望收益排序、混合皿 `silent_balanced` 与 specialist `silent_not_only` 的 gap 至少 0.4/win）
+
+为什么不直接降 `R_NOT_SILENT_RAW`（看上去也能让 silent 饿死）？因为 v2.2 那个数字对**混合皿**仍然是必要的（NOT 模式占 50% 窗口，silent 在 NOT 上的收入是混合皿存活率的一半来源）。改它会破坏混合皿的"软反崩塌"契约。`reward_wrong` 是更聚焦的 knob——只在专门 specialize 的环境里启用"答错就罚"，混合皿的"答错只赔 breath、不赔加项"原样不动。
+
+生物对齐：从"耕地条件"角度看，混合皿是**多样化生态**（错了也有别的食物可吃，类似机会主义食腐），specialist 皿是**单一资源生态**（错了直接饿死，类似严格的 obligate parasite）。这两类生态的代谢经济本来就该不一样。
+
+### 5.11 ERRATA v3.3：Path D1 — `not_only` 用"反跟随结构 seed"取代抑制偏置
+
+**v3.1 + v3.2 实测结局：**`not_only` 培养皿 founder **全员第一时间饿死**——v3.1 给的"抑制 founder 分布" `Uniform(-1.5, +0.5)` 让所有 founder 都是 silent（E[Σw·s] < 0 → I_o 永远到不了阈值），叠加 v3.2 的"silent 罚款"，整窝在前几窗口集体灭绝。两个本来各自合理的修法**互相否决**。
+
+**复盘**：v3.1 的诊断错了一层。NOT 不是"权重普遍负"那么简单——NOT 是 **context-gated routing**：A 高时压住 output，A 低时让一个 tonic 源把 output 推过阈值。随机或均匀负偏置的 founder **几乎不可能**在 colony 实际跑得起的时间内突变出这种"路由拓扑"——搜索空间太大。问题的根本是 abiogenesis 难题：从噪声里发明一个特定电路 ≠ 在已有电路上调参数。
+
+**v3.3 改用 Path D1：把"噪声先验"换成"结构先验"。** 每一只 `not_only` founder 出生就携带一个手工设计的反跟随微电路：
+
+```
+Hidden 0..9   = A-detectors:
+    A→hidden:  Uniform(+1.5, +3.0)   ← 强正：跟随 A 通道
+    hidden→out: Uniform(−4.0, −2.0)  ← 强负：A 高时压输出
+Hidden 10..19 = S-tonic drivers:
+    S→hidden:  Uniform(+3.0, +5.0)   ← 强正：S=80Hz 持续点亮
+    hidden→out: Uniform(+1.0, +2.5)  ← 正：常态推动输出
+其他位置:      Uniform(−0.2, +0.2)   ← 小噪声，给突变留可发现的底物
+```
+
+**S=80Hz 时的预期行为**（实测验证一致）：
+
+- a=1（75Hz）→ A-detectors 发放 ~50Hz → 压住 output → **6Hz**（远低于 20Hz 阈值）✓
+- a=0（25Hz）→ A-detectors 静默 → S-tonic 主导 → **32Hz**（清晰高于阈值）✓
+
+每只 founder 在结构带宽内独立采样噪声，所以选择压力依然有"个体差异"可作用；被 D1 抹掉的只是"凭空发明路由"那一步**不可达**的搜索负担。
+
+**仿真验证**（200 只 founder，200 窗口，无任何外部干预）：
+
+| 时刻 | 存活 | 平均 credit | NOT 命中率 |
+|---|---|---|---|
+| 出生 | 200 | 50 | — |
+| win 50 | 200 | 133 | **98.12%** |
+| win 200 | 200 | 163 | **97.62%** |
+
+对照 v3.1+v3.2：win 50 NOT 命中率 0%、累计死亡 700。**6 个数量级以上**的能效差距。
+
+**生物对齐**：D1 不是"intelligent design 反对达尔文"，它就是 LTEE 的标准操作——Lenski 不会从化学汤开始养 *E. coli*，而是从一只**已经有完整代谢机构的祖先**起跑。我们的 not_only 也只是"研究 NOT 拓扑能否被精修"，而不是"研究 NOT 能否从随机权重中 abiogenesise"——后者是 abiogenesis 问题，本来就不该让 colony 在分钟级时间尺度承担。生物界精确对应的现象包括：
+
+- **GABA 能神经元的演化起源**：从 glutamatergic 祖先经一次离子通道极性翻转变出抑制性输出
+- **视网膜 ON / OFF 通路**：相同电路、相反极性，单突触级别的差异
+- **Pax6 跨胚层逆向调控**：同一个转录因子在不同组织里产生相反结果
+
+代码足迹：
+- `population.py` 加 11 个 seed 常量 + 一个 `_init_weights_l2v2_not_seed()` 函数（~50 行）
+- 删除 v3.1 的 `L2V2_WEIGHT_INIT_LOW_INHIB` / `HIGH_INHIB`（混合皿契约不变）
+- 4 个新回归测试：拓扑结构（A→A-det 正、A-det→out 负、S→S-tonic 正、S-tonic→out 正）、个体多样性（per-cell std > 0、所有 founder 唯一）、行为功能（a=high 静默 + a=low 发放）、混合皿不被影响（balanced/uniform/extreme/and_only 仍走 v2.5 默认分布）
+
+哲学注脚（用户提出）：D1 印证了一个被 RNA-world / Maxwell's demon / 柯尔莫哥洛夫复杂度反复给出的结论——**演化不是从无到有的信息创造，而是已有信息的精炼**。"原罪"这个比喻挺贴切：那个非选择得来的、却又是后续一切选择得以发生的初始结构，必须有人付了那笔信息税。在我们这里，那个"原罪"就是 D1 写在 founder DNA 里的反跟随拓扑。
+
 ---
 
 ## 6. 未来演进方向

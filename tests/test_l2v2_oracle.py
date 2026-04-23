@@ -285,12 +285,17 @@ def test_v23_silent_starves_perfect_dominates():
 
 # ── v2.3.1 difficulty presets (environment-shaping slider) ─────────────────
 def test_difficulty_presets_registry_complete():
-    """All four named presets must resolve and carry the three required keys."""
+    """All four named presets must resolve and carry the four required keys
+    (v3.2 added reward_wrong; sampling probabilities still in [0,1])."""
+    expected_keys = {
+        "p_mode_and", "p_and_target_one", "p_not_target_one", "reward_wrong",
+    }
+    prob_keys = {"p_mode_and", "p_and_target_one", "p_not_target_one"}
     for name in ("uniform", "balanced", "hard", "extreme"):
         w = difficulty_weights(name)
-        assert set(w.keys()) == {"p_mode_and", "p_and_target_one", "p_not_target_one"}
-        for k, v in w.items():
-            assert 0.0 <= v <= 1.0, f"{name}.{k}={v} out of [0,1]"
+        assert set(w.keys()) == expected_keys
+        for k in prob_keys:
+            assert 0.0 <= w[k] <= 1.0, f"{name}.{k}={w[k]} out of [0,1]"
     assert DEFAULT_TASK_DIFFICULTY in TASK_DIFFICULTY_PRESETS
 
 
@@ -602,6 +607,327 @@ def test_l2v2_fitness_undefined_until_both_modes_seen():
     assert pop._fitness_defined(0) is True
     # Mean accuracy = (1 + 0) / 2 = 0.5
     assert pop._fitness_slot(0) == pytest.approx(0.5)
+
+
+# ── ERRATA v3.1 — specialist-mode fitness gating ───────────────────────────
+def test_l2v2_specialist_and_only_fitness_defined_after_one_and_sample():
+    """In and_only dish, fitness is defined as soon as the agent has one AND
+    sample — requiring NOT samples (which never come) used to freeze the
+    entire population at sigma=SIGMA_BASE forever."""
+    rng = np.random.default_rng(7)
+    pop = Population(
+        pop_max=4, rng=rng, n_initial=4, task=TASK_L2V2,
+        task_difficulty="and_only",
+    )
+    assert pop._fitness_defined(0) is False
+    pop._record_logic_window(0, MODE_AND, True)
+    assert pop._fitness_defined(0) is True
+    # Specialist fitness reflects only the active mode (full 1.0, not 0.5).
+    assert pop._fitness_slot(0) == pytest.approx(1.0)
+
+
+def test_l2v2_specialist_not_only_fitness_defined_after_one_not_sample():
+    rng = np.random.default_rng(8)
+    pop = Population(
+        pop_max=4, rng=rng, n_initial=4, task=TASK_L2V2,
+        task_difficulty="not_only",
+    )
+    assert pop._fitness_defined(0) is False
+    pop._record_logic_window(0, MODE_NOT, True)
+    assert pop._fitness_defined(0) is True
+    assert pop._fitness_slot(0) == pytest.approx(1.0)
+
+
+def test_l2v2_specialist_global_sigma_anneals():
+    """Once specialist agents have valid fitness, sigma must drop below
+    SIGMA_BASE — the headline symptom of the v3.1 bug was sigma locked at
+    its max because mean_f stayed 0 for the whole run."""
+    from archaea.population import SIGMA_BASE
+    rng = np.random.default_rng(9)
+    pop = Population(
+        pop_max=4, rng=rng, n_initial=4, task=TASK_L2V2,
+        task_difficulty="not_only",
+    )
+    # Inject perfect NOT for all 4 living slots.
+    for slot in range(4):
+        pop._record_logic_window(slot, MODE_NOT, True)
+    sigma = pop.global_sigma()
+    # exp(-2 * 1.0) ≈ 0.135 → expect sigma ≈ 0.135 * SIGMA_BASE, well below max.
+    assert sigma < 0.5 * SIGMA_BASE
+
+
+def test_l2v2_mixed_dish_still_requires_both_modes():
+    """Regression: the v3.1 carve-out must NOT loosen the contract for
+    mixed dishes (the original v2.0 guarantee that a brand-new agent who
+    has only seen AND windows is treated as undefined)."""
+    rng = np.random.default_rng(10)
+    pop = Population(
+        pop_max=4, rng=rng, n_initial=4, task=TASK_L2V2,
+        task_difficulty="balanced",
+    )
+    pop._record_logic_window(0, MODE_AND, True)
+    assert pop._fitness_defined(0) is False
+    pop._record_logic_window(0, MODE_NOT, True)
+    assert pop._fitness_defined(0) is True
+
+
+# ── ERRATA v3.3 (Path D1) — anti-follower structural seed for not_only ─────
+def test_l2v2_not_only_seed_has_anti_follower_topology():
+    """ERRATA v3.3 (D1): not_only founders must be born with anti-follower
+    micro-circuit, not random noise.  Specifically:
+      * A→A-detectors      strongly positive
+      * A-detectors→output strongly NEGATIVE
+      * S→S-tonic-drivers  positive
+      * S-tonic→output     positive
+    All other paths get small symmetric noise.
+    """
+    from archaea.neuron import N_HIDDEN, N_INPUT
+    from archaea.population import L2V2_NOT_SEED_H_A_DET
+
+    pop = Population(
+        pop_max=64, rng=np.random.default_rng(11), n_initial=64,
+        task=TASK_L2V2, task_difficulty="not_only",
+    )
+    w = pop.weights[pop.alive]              # (64, 220)
+    w_ih = w[:, : N_INPUT * N_HIDDEN].reshape(-1, N_INPUT, N_HIDDEN)
+    w_ho = w[:, N_INPUT * N_HIDDEN :].reshape(-1, N_HIDDEN)
+
+    a_lo, a_hi = 0, N_CH_A
+    s_lo, s_hi = N_CH_A + N_CH_B, N_INPUT
+    h_det = L2V2_NOT_SEED_H_A_DET
+
+    # A-detector pathway: A→hidden positive, hidden→output negative.
+    a_to_det = w_ih[:, a_lo:a_hi, :h_det]
+    det_to_out = w_ho[:, :h_det]
+    assert a_to_det.mean() > 0.9, a_to_det.mean()
+    assert (a_to_det > 0).mean() > 0.95, "A→A-det should be uniformly positive"
+    assert det_to_out.mean() < -0.9, det_to_out.mean()
+    assert (det_to_out < 0).mean() > 0.95, "A-det→out should be uniformly negative"
+
+    # S-tonic pathway: S→hidden positive, hidden→output positive.
+    s_to_tonic = w_ih[:, s_lo:s_hi, h_det:]
+    tonic_to_out = w_ho[:, h_det:]
+    assert s_to_tonic.mean() > 0.7, s_to_tonic.mean()
+    assert (s_to_tonic > 0).mean() > 0.95, "S→S-tonic should be uniformly positive"
+    assert tonic_to_out.mean() > 0.6, tonic_to_out.mean()
+    assert (tonic_to_out > 0).mean() > 0.95, "S-tonic→out should be uniformly positive"
+
+    # Background noise: everywhere else hovers near zero (within ±0.2).
+    # Spot-check the B→A-detector cells (no structural role).
+    b_to_det = w_ih[:, N_CH_A : N_CH_A + N_CH_B, :h_det]
+    assert abs(b_to_det.mean()) < 0.05, b_to_det.mean()
+    assert b_to_det.min() >= -0.21 and b_to_det.max() <= 0.21
+
+
+def test_l2v2_not_only_seed_per_agent_diversity():
+    """D1 must seed *structure*, not clones.  Each founder should have its
+    own draw of noise — std across the population on any single weight cell
+    must be > 0 so mutation+selection has variation to work on."""
+    pop = Population(
+        pop_max=128, rng=np.random.default_rng(20), n_initial=128,
+        task=TASK_L2V2, task_difficulty="not_only",
+    )
+    w = pop.weights[pop.alive]
+    # Per-cell std across the population: median should be clearly > 0.
+    cell_std = w.std(axis=0)
+    assert float(np.median(cell_std)) > 0.05, np.median(cell_std)
+    # No two founders should be exactly identical.
+    pair_diffs = (w[0:1] != w).any(axis=1).sum()
+    assert pair_diffs >= 127, "expected unique founder weight vectors"
+
+
+def test_l2v2_not_only_seed_produces_anti_following_behaviour():
+    """Functional acceptance test: a freshly-seeded not_only colony should,
+    on average, output near-silent when a=1 and spike when a=0 — *before
+    any evolution has happened*.  This is the whole point of D1: the
+    founder population is already a viable NOT specialist.
+    """
+    from archaea.neuron import NetworkBatch
+    from archaea.oracle import (
+        LOGIC_HIGH_HZ, LOGIC_LOW_HZ, S_NOT_HZ,
+        OUT_SPIKING_THRESHOLD_HZ, poisson_three_channels,
+    )
+
+    rng = np.random.default_rng(2027)
+    pop = Population(
+        pop_max=64, rng=rng, n_initial=64,
+        task=TASK_L2V2, task_difficulty="not_only",
+    )
+    weights = pop.weights[pop.alive].copy()
+
+    # Drive the network for one 500 ms window with a=HIGH, b=LOW, S=NOT_HZ.
+    # Target: silent (NOT 1 = 0).
+    net_high = NetworkBatch(weights, rng=np.random.default_rng(101))
+    spikes_high = poisson_three_channels(
+        np.random.default_rng(102),
+        f_a_hz=LOGIC_HIGH_HZ, f_b_hz=LOGIC_LOW_HZ, f_s_hz=S_NOT_HZ,
+        duration_ms=500.0,
+    )
+    out_high = np.zeros(len(weights))
+    for t in range(spikes_high.shape[0]):
+        out_high += net_high.step(spikes_high[t]).reshape(-1)
+    rate_high = out_high / 0.5  # Hz
+
+    # Same colony, but a=LOW.  Target: spike (NOT 0 = 1).
+    net_low = NetworkBatch(weights, rng=np.random.default_rng(103))
+    spikes_low = poisson_three_channels(
+        np.random.default_rng(104),
+        f_a_hz=LOGIC_LOW_HZ, f_b_hz=LOGIC_LOW_HZ, f_s_hz=S_NOT_HZ,
+        duration_ms=500.0,
+    )
+    out_low = np.zeros(len(weights))
+    for t in range(spikes_low.shape[0]):
+        out_low += net_low.step(spikes_low[t]).reshape(-1)
+    rate_low = out_low / 0.5
+
+    # Headline: median agent should spike on a=0 and stay below threshold on a=1.
+    med_high = float(np.median(rate_high))
+    med_low = float(np.median(rate_low))
+    assert med_high < OUT_SPIKING_THRESHOLD_HZ, (
+        f"founders should be quiet when a=high, got median {med_high:.1f} Hz"
+    )
+    assert med_low > OUT_SPIKING_THRESHOLD_HZ, (
+        f"founders should spike when a=low, got median {med_low:.1f} Hz"
+    )
+    # Anti-correlation: a=low rate should be at least 2× a=high rate at the
+    # population median — coarse but catches the topology being inverted.
+    assert med_low > 2.0 * max(med_high, 1.0), (med_low, med_high)
+
+
+def test_l2v2_not_only_seed_does_not_affect_mixed_dishes():
+    """Default mixed dishes (balanced/uniform/extreme) must keep the
+    Uniform(-0.5, +1.5) prior — the v2.5 anti-collapse contract.  D1 is
+    *only* applied when task_difficulty == 'not_only'."""
+    from archaea.population import L2V2_WEIGHT_INIT_LOW, L2V2_WEIGHT_INIT_HIGH
+
+    for name in ("balanced", "uniform", "extreme", "and_only"):
+        pop = Population(
+            pop_max=64, rng=np.random.default_rng(hash(name) & 0xFFFF),
+            n_initial=64, task=TASK_L2V2, task_difficulty=name,
+        )
+        mean_w = float(pop.weights[pop.alive].mean())
+        assert 0.3 < mean_w < 0.7, (name, mean_w)
+        lo = float(pop.weights[pop.alive].min())
+        hi = float(pop.weights[pop.alive].max())
+        assert lo >= L2V2_WEIGHT_INIT_LOW - 1e-9, (name, lo)
+        assert hi <= L2V2_WEIGHT_INIT_HIGH + 1e-9, (name, hi)
+
+
+# ── ERRATA v3.2 — specialist-dish wrong-answer penalty ─────────────────────
+def test_specialist_presets_carry_negative_reward_wrong():
+    """Both specialist dishes must ship a -BREATH_PER_WINDOW reward_wrong;
+    mixed dishes must keep reward_wrong = 0 (v2.2 anti-collapse invariant)."""
+    from archaea.economy import BREATH_PER_WINDOW
+    for name in ("and_only", "not_only"):
+        assert TASK_DIFFICULTY_PRESETS[name]["reward_wrong"] == pytest.approx(
+            -BREATH_PER_WINDOW
+        ), name
+    for name in ("uniform", "balanced", "hard", "extreme"):
+        assert TASK_DIFFICULTY_PRESETS[name]["reward_wrong"] == 0.0, name
+
+
+def test_oracle_sample_applies_reward_wrong():
+    """The reward_wrong arg must propagate to OracleSample.reward_wrong."""
+    rng = np.random.default_rng(42)
+    s = draw_oracle_sample(rng, reward_wrong=-1.25)
+    assert s.reward_wrong == pytest.approx(-1.25)
+    s_default = draw_oracle_sample(rng)
+    assert s_default.reward_wrong == 0.0
+
+
+def test_not_only_silent_strategy_has_negative_expected_credit():
+    """Headline guarantee of v3.2: in not_only, an always-silent agent
+    must have NEGATIVE expected credit per window so silent strategy
+    starves out and selection pressure for true NOT can form.
+
+    Computes expected per-window net credit analytically for the four
+    archetypal strategies and asserts the ranking + signs."""
+    from archaea.economy import BREATH_PER_WINDOW
+    w = difficulty_weights("not_only")
+    rwrong = w["reward_wrong"]
+
+    # Half the windows have target=0 (a=1, agent should stay silent),
+    # half have target=1 (a=0, agent should spike).  Compute expected
+    # reward (table + effort bonus) per strategy.
+    def strategy_net(spike_on_target_0: bool, spike_on_target_1: bool) -> float:
+        # target=0 (silent is correct)
+        if spike_on_target_0:
+            r0 = rwrong + spike_effort_bonus(75.0, 0)         # 75 Hz = "spike"
+        else:
+            r0 = (R_NOT_SILENT_RAW * REWARD_SCALE) + spike_effort_bonus(0.0, 0)
+        # target=1 (spike is correct)
+        if spike_on_target_1:
+            r1 = (R_NOT_SPIKE_RAW * REWARD_SCALE) + spike_effort_bonus(75.0, 1)
+        else:
+            r1 = rwrong + spike_effort_bonus(0.0, 1)
+        return 0.5 * (r0 + r1) - BREATH_PER_WINDOW
+
+    silent       = strategy_net(False, False)   # always silent
+    always_spike = strategy_net(True,  True)
+    smart_not    = strategy_net(False, True)    # silent when a=1, spike when a=0
+    anti_not     = strategy_net(True,  False)   # spike when a=1, silent when a=0
+
+    # The whole point of v3.2:
+    assert silent < 0.0, f"silent must starve in not_only, got {silent}"
+    # Always-spike still pays more than breath so day-zero excitatory founders
+    # don't go extinct before mutations find smart NOT.
+    assert always_spike > 0.0, f"always-spike must survive, got {always_spike}"
+    # Smart NOT must out-reproduce always-spike (not necessarily by a huge
+    # margin — selection just needs a ranking, not an arms race).
+    assert smart_not > always_spike
+    # Anti-NOT (perfectly wrong) is the worst of all.
+    assert anti_not < silent
+
+
+def test_specialist_silent_strictly_more_punished_than_mixed_silent():
+    """v3.2 invariant: silent strategy must be much more punished in
+    specialist dishes than in mixed dishes — that is the point of the
+    new reward_wrong field.  Concretely, the specialist silent net must
+    be at least one breath-cycle (1.25 credit/win) worse than the mixed
+    silent net so the silent attractor in not_only / and_only collapses
+    while the mixed-dish 'barely viable silent' contract is preserved.
+    """
+    from archaea.economy import BREATH_PER_WINDOW
+
+    def silent_net(difficulty: str) -> float:
+        w = difficulty_weights(difficulty)
+        rwrong = w["reward_wrong"]
+        p_and = w["p_mode_and"]
+        p_a1 = w["p_and_target_one"]
+        p_n1 = w["p_not_target_one"]
+        # In each mode the silent agent's reward depends only on whether
+        # this window's target_bit was 0 (silent correct) or 1 (silent wrong).
+        # P(target=1 | AND) = p_a1; P(target=1 | NOT) = p_n1.
+        and_silent_correct = R_AND_SILENT_RAW * REWARD_SCALE + spike_effort_bonus(0.0, 0)
+        and_silent_wrong = rwrong + spike_effort_bonus(0.0, 1)
+        not_silent_correct = R_NOT_SILENT_RAW * REWARD_SCALE + spike_effort_bonus(0.0, 0)
+        not_silent_wrong = rwrong + spike_effort_bonus(0.0, 1)
+        expected = (
+            p_and * ((1 - p_a1) * and_silent_correct + p_a1 * and_silent_wrong)
+            + (1 - p_and) * ((1 - p_n1) * not_silent_correct + p_n1 * not_silent_wrong)
+        )
+        return expected - BREATH_PER_WINDOW
+
+    silent_balanced = silent_net("balanced")
+    silent_not_only = silent_net("not_only")
+    silent_and_only = silent_net("and_only")
+
+    # Specialist silent must be DECISIVELY negative (well past the
+    # "barely starving" range that mixed dishes hover in).
+    assert silent_not_only < -0.5, silent_not_only
+    assert silent_and_only < -0.5, silent_and_only
+    # The gap between mixed and specialist must be at least
+    # half a breath cycle — empirically it's exactly
+    # |reward_wrong| × P(wrong window) = 1.25 × 0.5 = 0.625 for not_only.
+    assert silent_balanced - silent_not_only > 0.4, (
+        silent_balanced, silent_not_only
+    )
+    assert silent_balanced - silent_and_only > 0.4, (
+        silent_balanced, silent_and_only
+    )
+    # Mixed dishes must still hover near zero (NOT punished hard) so the
+    # v2.2 "soft anti-collapse" contract holds — within ±half a breath.
+    assert abs(silent_balanced) < BREATH_PER_WINDOW / 2, silent_balanced
 
 
 def test_l2v2_logic_history_ring_overwrites():

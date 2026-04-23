@@ -51,7 +51,16 @@ from .oracle import (
     poisson_three_channels,
     spike_effort_bonus,
 )
-from .task import DEFAULT_TASK, TASK_L1, TASK_L2V2, is_logic_task, validate_task
+from .task import (
+    DEFAULT_TASK,
+    N_CH_A,
+    N_CH_B,
+    N_CH_S,
+    TASK_L1,
+    TASK_L2V2,
+    is_logic_task,
+    validate_task,
+)
 
 SIGMA_BASE = 0.3
 
@@ -94,6 +103,92 @@ class FounderInjection:
 # colony runs at.  See docs/project-summary.md §L2.5 for the full rationale.
 L2V2_WEIGHT_INIT_LOW = -0.5
 L2V2_WEIGHT_INIT_HIGH = 1.5
+
+# ERRATA v3.3 (Path D1) — "anti-follower" pre-evolved seed for not_only.
+# ────────────────────────────────────────────────────────────────────────────
+# v3.1 tried "inhibitory bias founder" (Uniform(-1.5, +0.5)) — the reasoning
+# was: NOT needs negative output coupling, so let evolution start with a
+# negative weight budget.  In v3.2 we paired that with a wrong-answer penalty
+# so silent agents starve.  But v3.1+v3.2 combined are mathematically
+# self-defeating: an inhibition-biased founder is *silent* on every input
+# (E[Σw·s] < 0 → I_o < threshold → never fires), and v3.2 then starves
+# every silent agent before it can reproduce.  Whole population dies in
+# the first few windows.  Diagnosis: v3.1 was fixing the wrong end of the
+# pipe.  NOT is not "inhibition everywhere"; NOT is *context-gated routing*
+# — A high → suppress output, A low → let a tonic source drive output.
+# Random or uniformly-inhibitory founders cannot stumble into this routing
+# topology with positive probability in the time-scales the colony runs at.
+#
+# v3.3 replaces the noise prior with a *structural* prior: every not_only
+# founder is born with a hand-designed anti-follower micro-circuit, and
+# evolution's job is reduced to refining the magnitudes.  Topology:
+#
+#   * Hidden 0..H_A_DET-1   = "A-detectors":
+#         A→h:  strongly positive   → hidden tracks A channel
+#         h→o:  strongly NEGATIVE   → A high suppresses output
+#   * Hidden H_A_DET..N_HIDDEN-1 = "S-tonic drivers":
+#         S→h:  strongly positive   → S=80Hz drives hidden constantly
+#         h→o:  positive            → keeps output spiking unless suppressed
+#   * All other input→hidden cells (B paths, cross-specialisation paths)
+#     get small symmetric noise → the substrate for mutation to discover
+#     refinements (e.g. NOT-on-B, AND-comorbidity).
+#
+# Net behaviour with this seed at f_s=80Hz:
+#   a=1 (75Hz)  →  A-detectors fire   → suppress output  → silent ✓
+#   a=0 (25Hz)  →  A-detectors silent → S-tonic drives   → spike  ✓
+#
+# This is *not* intelligent design in the pejorative sense — it's the same
+# prebiotic-selection move as v2.5 (Uniform(-0.5,+1.5) was *also* a
+# structured prior, just one that happened to favour excitation), only now
+# the structure is targeted at the niche we want to colonise.  Biological
+# precedent: GABAergic neurons evolved from glutamatergic ancestors via
+# postsynaptic ion-channel polarity flip; ON/OFF retinal ganglion cells
+# share architecture but differ at one synapse's polarity.  See
+# docs/project-summary.md §5.11 for the full rationale.
+#
+# Magnitude rationale (LIF V_THRESH=1.0, R=1.0, I_IN=2.5, tau=20ms,
+# channels at 25/75/80 Hz, refractory 2ms):
+#
+# A hidden cell driven by k Poisson channels (each at rate f, weight w)
+# sees a per-ms expected current I_avg = I_IN · w · k · f/1000.
+# Firing happens when I_avg ≳ V_threshold (=1.0).  For:
+#
+#   * A→A-detectors (k=4, f=75Hz at A-high):
+#         w=2.25 → I_avg = 2.5·2.25·4·0.075 = 1.69 → A-det fires ~50Hz ✓
+#         w=2.25 at a-low (f=25Hz):
+#             I_avg = 2.5·2.25·4·0.025 = 0.56 → A-det stays quiet ✓
+#   * S→S-tonic (k=2, f=80Hz):
+#         w=4.0 → I_avg = 2.5·4·2·0.08 = 1.6 → S-tonic fires ~40Hz ✓
+#
+# A-det→output: 10 A-dets at 50Hz → 0.5 spikes/ms expected.  With
+# w=-3.0: contribution = 2.5·(-3.0)·0.5 = -3.75 (heavy suppression).
+# S-tonic→output: 10 tonics at 40Hz → 0.4 spikes/ms.  With w=1.75:
+# contribution = +1.75 → drives output when A is silent.  Net at
+# a=high (-3.75+1.75 = -2.0 → silent), a=low (0+1.75 = +1.75 → fires).
+#
+# These weights are larger than the v2.5 mixed-dish range (Uniform(-0.5,
+# +1.5)) because the structural roles need stronger drive — but that's
+# fine: this seed is the FOUNDER of the not_only niche, mutation-
+# selection then refines from here.  global_sigma annealing handles
+# magnitude-scale exploration.
+L2V2_NOT_SEED_STRONG_POS_LOW = 1.5
+L2V2_NOT_SEED_STRONG_POS_HIGH = 3.0
+L2V2_NOT_SEED_STRONG_NEG_LOW = -4.0
+L2V2_NOT_SEED_STRONG_NEG_HIGH = -2.0
+L2V2_NOT_SEED_TONIC_POS_LOW = 3.0
+L2V2_NOT_SEED_TONIC_POS_HIGH = 5.0
+L2V2_NOT_SEED_OUT_TONIC_LOW = 1.0
+L2V2_NOT_SEED_OUT_TONIC_HIGH = 2.5
+L2V2_NOT_SEED_NOISE_LOW = -0.2
+L2V2_NOT_SEED_NOISE_HIGH = 0.2
+# Hidden-layer split: half do A-detection, half do S-tonic driving.  Even
+# split keeps both pathways equally represented at birth so mutation +
+# selection can re-balance per niche.
+L2V2_NOT_SEED_H_A_DET = N_HIDDEN // 2
+
+# Difficulty preset name that triggers the anti-follower structural seed.
+# Kept as a constant so tests/UI can reference it without string-matching.
+DIFFICULTY_ANTI_FOLLOWER_SEED = "not_only"
 
 # Per-mode rolling correctness window (in 500 ms windows).  Smaller than
 # N_HISTORY because logic windows are noisy; 20 keeps the bar reactive.
@@ -198,6 +293,8 @@ class Population:
         "admixture_window_s",
         "admixture_hgt_multiplier",
         "_t_sim_seconds",
+        "_needs_and_samples",
+        "_needs_not_samples",
     )
 
     def __init__(
@@ -224,6 +321,16 @@ class Population:
         # asynchronously inside the sim loop.
         self.task_difficulty = str(task_difficulty)
         self._difficulty_weights = difficulty_weights(self.task_difficulty)
+        # SPEC_L2_V3.0 §1.5 — derive which logic modes can ever be sampled
+        # in this difficulty preset.  Specialist dishes (and_only / not_only)
+        # have p_mode_and = 1.0 or 0.0 respectively, so one of the buffers
+        # is permanently empty.  We use these flags to gate _fitness_defined
+        # and _logic_fitness_slot — without them an entire specialist
+        # population is forever "fitness undefined", which silently breaks
+        # sigma annealing and elite-victim selection (see ERRATA v3.1).
+        p_and = float(self._difficulty_weights.get("p_mode_and", 0.5))
+        self._needs_and_samples: bool = p_and > 0.0
+        self._needs_not_samples: bool = p_and < 1.0
         n0 = self.pop_max if n_initial is None else min(int(n_initial), self.pop_max)
         if budget_mode not in VALID_BUDGET_MODES:
             raise ValueError(
@@ -307,21 +414,94 @@ class Population:
                 self.spawn_initial_slot(i)
 
     def _init_weights_for_task(self) -> np.ndarray:
-        """Sample one fresh weight vector with the task-appropriate range.
+        """Sample one fresh weight vector with the task-appropriate prior.
 
-        L1   : Uniform(-3, 3)        — SPEC §1.1.
-        L2v2 : Uniform(-0.5, 1.5)    — SPEC_L2_V2.0 §3.1 inhibitory weights
-                                       with v2.5 prebiotic-stage offset
-                                       (~25% negative, satisfies the SPEC's
-                                       "≥20% negative" requirement; positive
-                                       mean so founders are evolvable, see
-                                       L2V2_WEIGHT_INIT_LOW comment block).
+        L1                  : Uniform(-3, 3)        — SPEC §1.1.
+        L2v2 (default/mixed): Uniform(-0.5, +1.5)   — SPEC_L2_V2.0 §3.1
+                              with v2.5 prebiotic-stage offset
+                              (E[w]=+0.5; ~25% negative).  Founders spike
+                              enough to bootstrap evolution.
+        L2v2 (not_only)     : Anti-follower structural seed — ERRATA v3.3.
+                              Hidden layer split into A-detectors (suppress
+                              output when A high) and S-tonic drivers
+                              (drive output when S high).  Each agent draws
+                              independent noise so selection still has
+                              variation to operate on.  See the
+                              L2V2_NOT_SEED_* comment block above.
         """
         if self.task == TASK_L2V2:
+            if self.task_difficulty == DIFFICULTY_ANTI_FOLLOWER_SEED:
+                return self._init_weights_l2v2_not_seed()
             return self.rng.uniform(
                 L2V2_WEIGHT_INIT_LOW, L2V2_WEIGHT_INIT_HIGH, size=N_WEIGHTS
             )
         return self.rng.uniform(-3.0, 3.0, size=N_WEIGHTS)
+
+    def _init_weights_l2v2_not_seed(self) -> np.ndarray:
+        """ERRATA v3.3 (Path D1) — anti-follower structural seed founder.
+
+        Lays down a NOT-prone micro-circuit at birth instead of asking
+        random noise to discover one.  Layout (220-vector unpacked into
+        w_ih (10×20) and w_ho (20×1)):
+
+            input rows   0..3  = A channels   (N_CH_A=4)
+            input rows   4..7  = B channels   (N_CH_B=4)
+            input rows   8..9  = S channels   (N_CH_S=2)
+            hidden cols  0..H_A_DET-1   = A-detectors
+            hidden cols  H_A_DET..19    = S-tonic drivers
+
+        Strong-positive bands wire detectors/drivers; strong-negative band
+        wires A-detector→output (suppression); modest-positive band wires
+        S-tonic→output (drive).  Everything else gets symmetric small
+        noise so mutation has a discoverable substrate (cf. AND-comorbid
+        circuits, NOT-on-B variants).
+        """
+        rng = self.rng
+        w = np.empty(N_WEIGHTS, dtype=np.float64)
+        w_ih = w[: N_INPUT * N_HIDDEN].reshape(N_INPUT, N_HIDDEN)
+        w_ho = w[N_INPUT * N_HIDDEN :].reshape(N_HIDDEN, N_OUTPUT)
+
+        # 1) symmetric small-noise background everywhere
+        w_ih[:] = rng.uniform(
+            L2V2_NOT_SEED_NOISE_LOW, L2V2_NOT_SEED_NOISE_HIGH, size=w_ih.shape
+        )
+        w_ho[:] = rng.uniform(
+            L2V2_NOT_SEED_NOISE_LOW, L2V2_NOT_SEED_NOISE_HIGH, size=w_ho.shape
+        )
+
+        # 2) channel index ranges for A / B / S in the input vector
+        a_lo, a_hi = 0, N_CH_A
+        s_lo, s_hi = N_CH_A + N_CH_B, N_INPUT
+        h_a_det = L2V2_NOT_SEED_H_A_DET
+
+        # 3) A-detectors (hidden cols 0..h_a_det-1)
+        #    A→hidden: strong positive  — track A channel
+        w_ih[a_lo:a_hi, :h_a_det] = rng.uniform(
+            L2V2_NOT_SEED_STRONG_POS_LOW,
+            L2V2_NOT_SEED_STRONG_POS_HIGH,
+            size=(N_CH_A, h_a_det),
+        )
+        #    hidden→output: strong NEGATIVE — A high suppresses output
+        w_ho[:h_a_det, 0] = rng.uniform(
+            L2V2_NOT_SEED_STRONG_NEG_LOW,
+            L2V2_NOT_SEED_STRONG_NEG_HIGH,
+            size=h_a_det,
+        )
+
+        # 4) S-tonic drivers (hidden cols h_a_det..N_HIDDEN-1)
+        #    S→hidden: positive — S=80Hz keeps these hidden cells firing
+        w_ih[s_lo:s_hi, h_a_det:N_HIDDEN] = rng.uniform(
+            L2V2_NOT_SEED_TONIC_POS_LOW,
+            L2V2_NOT_SEED_TONIC_POS_HIGH,
+            size=(N_CH_S, N_HIDDEN - h_a_det),
+        )
+        #    hidden→output: positive — drive output unless suppressed
+        w_ho[h_a_det:N_HIDDEN, 0] = rng.uniform(
+            L2V2_NOT_SEED_OUT_TONIC_LOW,
+            L2V2_NOT_SEED_OUT_TONIC_HIGH,
+            size=N_HIDDEN - h_a_det,
+        )
+        return w
 
     def _reset_logic_buffers_slot(self, slot: int) -> None:
         self._acc_and_buf[slot].fill(0)
@@ -430,12 +610,18 @@ class Population:
 
     def _fitness_defined(self, slot: int) -> bool:
         if self.task == TASK_L2V2:
-            # In L2v2 we treat fitness as "defined" once *both* mode buffers
-            # have at least one sample — otherwise a brand-new agent that has
-            # only seen AND windows would be ranked as if it could also do NOT.
-            return bool(
-                int(self._acc_and_n[slot]) > 0 and int(self._acc_not_n[slot]) > 0
-            )
+            # In L2v2 we require samples in *every* mode the environment can
+            # produce.  For mixed dishes that means BOTH buffers (otherwise a
+            # brand-new agent that has only seen AND windows would be ranked
+            # as if it could also do NOT).  For specialist dishes
+            # (and_only / not_only) one buffer is permanently empty by design,
+            # so we only require the buffer for the active mode — without
+            # this carve-out an entire specialist population stays
+            # "fitness undefined" forever, freezing sigma at SIGMA_BASE and
+            # degrading elite-victim selection to credit-only.  ERRATA v3.1.
+            and_ok = (not self._needs_and_samples) or int(self._acc_and_n[slot]) > 0
+            not_ok = (not self._needs_not_samples) or int(self._acc_not_n[slot]) > 0
+            return bool(and_ok and not_ok)
         return int(self._hc[slot]) >= N_HISTORY
 
     def _logic_acc_slot(self, slot: int, mode: int) -> float:
@@ -446,8 +632,24 @@ class Population:
         return (int(self._acc_not_hits[slot]) / n) if n > 0 else 0.0
 
     def _logic_fitness_slot(self, slot: int) -> float:
-        """Mean accuracy across AND and NOT, in [0, 1]."""
-        return 0.5 * (self._logic_acc_slot(slot, MODE_AND) + self._logic_acc_slot(slot, MODE_NOT))
+        """Mean accuracy across the modes this dish actually samples, in [0, 1].
+
+        Mixed dishes average AND and NOT (the historical behaviour).
+        Specialist dishes (and_only / not_only) report just the active
+        mode's accuracy — otherwise a perfect NOT-学家 caps at fitness 0.5,
+        which compresses sigma annealing's dynamic range and makes the
+        cultivated strain look weaker than it is in saved metadata.
+        """
+        if self._needs_and_samples and self._needs_not_samples:
+            return 0.5 * (
+                self._logic_acc_slot(slot, MODE_AND)
+                + self._logic_acc_slot(slot, MODE_NOT)
+            )
+        if self._needs_and_samples:
+            return self._logic_acc_slot(slot, MODE_AND)
+        if self._needs_not_samples:
+            return self._logic_acc_slot(slot, MODE_NOT)
+        return 0.0
 
     def _record_row_window(
         self, mode: int, bit_a: int, bit_b: int, n_correct: int, n_total: int
@@ -603,6 +805,12 @@ class Population:
                 p_mode_and=w["p_mode_and"],
                 p_and_target_one=w["p_and_target_one"],
                 p_not_target_one=w["p_not_target_one"],
+                # ERRATA v3.2 — specialist dishes pass -BREATH_PER_WINDOW so
+                # silent agents stop being free-riders.  Mixed dishes leave
+                # this at 0 (default) preserving the v2.2 anti-collapse
+                # invariant.  .get() keeps backward compat with any external
+                # preset that predates the reward_wrong field.
+                reward_wrong=w.get("reward_wrong", 0.0),
             )
             spikes = poisson_three_channels(
                 self.rng, oracle.f_a_hz, oracle.f_b_hz, oracle.f_s_hz, 500.0
