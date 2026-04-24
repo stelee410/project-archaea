@@ -190,6 +190,41 @@ L2V2_NOT_SEED_H_A_DET = N_HIDDEN // 2
 # Kept as a constant so tests/UI can reference it without string-matching.
 DIFFICULTY_ANTI_FOLLOWER_SEED = "not_only"
 
+# SPEC_L2_V3.5 — niche / species classification thresholds.
+# An agent counts as a "specialist" in a logic mode once its rolling per-mode
+# accuracy is at or above this threshold AND it has accumulated at least
+# NICHE_MIN_SAMPLES windows of evidence in that mode.  Below either bar, it's
+# classified as NOVICE (untrained / dead-on-arrival) regardless of luck.
+NICHE_SPECIALIST_THRESHOLD = 0.65
+NICHE_MIN_SAMPLES = 10
+
+# SPEC_L2_V3.5c — "hard-row" qualification for specialists.
+# Diagnostic motivation: under task_difficulty=balanced the (1,1)-AND row is
+# sampled ~50 % of AND windows, the other three (target=0) are ~50 % combined.
+# A 100 %-silent agent therefore scores 50 % on AND mode → just under the 0.65
+# bar, but a *half-firing* agent (only fires on (1,1) half the time) scores
+# 0.5×0.41 + 0.5×1.0 ≈ 0.70 — *passes* the bar while only half-learning the
+# hard row.  v3.5b's swarm metrics correctly reported this (acc_and_11_swarm
+# = 41 %), but the species classification still let those silent-pretenders
+# count as AND_EXPERT, which dragged the swarm denominator down.
+#
+# Fix: an agent is only an AND_EXPERT if it can ALSO clear the bar on the
+# specifically hard "produce 1" row, i.e. acc on (1,1)-AND windows ≥ this
+# threshold over at least NICHE_HARD_MIN_SAMPLES of those windows.  Same for
+# NOT (a=0)-rows.  The general per-mode bar still applies on top, so an agent
+# that only fires on (1,1) but misses the easy zeros doesn't accidentally
+# qualify either.
+NICHE_HARD_THRESHOLD = 0.50      # ≥ chance level on the hard "produce 1" row
+NICHE_HARD_MIN_SAMPLES = 5       # at least 5 of THAT specific row in history
+LOGIC_HARD_HISTORY = 16          # rolling buffer length for the hard rows
+
+# Species labels for the four-quadrant logic-space partition.  Stored as
+# small ints so telemetry can ship them as a flat list of 220 bytes.
+SPECIES_NOVICE = 0       # acc_AND < threshold AND acc_NOT < threshold
+SPECIES_AND_EXPERT = 1   # acc_AND ≥ threshold, acc_NOT < threshold
+SPECIES_NOT_EXPERT = 2   # acc_AND < threshold, acc_NOT ≥ threshold
+SPECIES_DUAL_EXPERT = 3  # acc_AND ≥ threshold AND acc_NOT ≥ threshold
+
 # Per-mode rolling correctness window (in 500 ms windows).  Smaller than
 # N_HISTORY because logic windows are noisy; 20 keeps the bar reactive.
 LOGIC_HISTORY = 20
@@ -273,6 +308,16 @@ class Population:
         "_acc_not_n",
         "_acc_and_buf",
         "_acc_not_buf",
+        # SPEC_L2_V3.5c — per-agent rolling buffer for the "hard" rows only.
+        # _acc_and_hard_buf records correct/wrong on (1,1)-AND windows;
+        # _acc_not_hard_buf records correct/wrong on (a=0)-NOT windows.
+        # Used by _species_of_slot to filter out silent-pretender specialists.
+        "_acc_and_hard_buf",
+        "_acc_and_hard_n",
+        "_acc_and_hard_idx",
+        "_acc_not_hard_buf",
+        "_acc_not_hard_n",
+        "_acc_not_hard_idx",
         # L2v2 last-window snapshot for telemetry
         "_last_oracle",
         "_last_consensus_bit",
@@ -289,12 +334,31 @@ class Population:
         "_row_buf_idx",
         "_row_buf_filled",
         "_last_row_acc",
-        # SPEC_L2_V3.0 §1.4 — admixture window (HGT boost for the first N seconds)
-        "admixture_window_s",
-        "admixture_hgt_multiplier",
+        # SPEC_L2_V3.4 — 3-phase admixture protocol (commensal → exchange → restored)
+        "admixture_commensal_s",
+        "admixture_exchange_s",
+        "admixture_phase2_blend",
+        "admixture_phase2_prob_mul",
         "_t_sim_seconds",
         "_needs_and_samples",
         "_needs_not_samples",
+        # SPEC_L2_V3.5 — assortative HGT (prezygotic isolation) + swarm-level
+        # dual-logic metrics (post-speciation L2 success criterion)
+        "assortative_temperature",
+        "_last_species_counts",          # {SPECIES_*: int}
+        "_last_acc_and_swarm",           # mean acc_AND over AND-or-dual experts
+        "_last_acc_not_swarm",           # mean acc_NOT over NOT-or-dual experts
+        "_last_colony_dual_acc",         # (acc_and_swarm + acc_not_swarm) / 2 if both species exist
+        # SPEC_L2_V3.5b — niche-aware consensus + per-row swarm accuracy.
+        # The legacy consensus_acc / acc_*_11_pop average over ALL alive agents,
+        # which under speciation gets diluted by the "wrong species correctly
+        # silent" cohort.  These swarm versions only count voters whose niche
+        # matches the current oracle mode.
+        "_last_consensus_acc_swarm",     # accuracy among on-niche voters this window
+        "_last_consensus_bit_swarm",     # majority vote among on-niche voters
+        "_last_consensus_voters_swarm",  # how many on-niche voters this window
+        "_row_buf_correct_swarm",        # parallel row buffers, only on-niche voters
+        "_row_buf_total_swarm",
     )
 
     def __init__(
@@ -310,8 +374,11 @@ class Population:
         task: str = DEFAULT_TASK,
         task_difficulty: str = DEFAULT_TASK_DIFFICULTY,
         founders: "list[FounderInjection] | None" = None,
-        admixture_window_s: float = 0.0,
-        admixture_hgt_multiplier: float = 1.0,
+        admixture_commensal_s: float = 0.0,
+        admixture_exchange_s: float = 0.0,
+        admixture_phase2_blend: float = 0.05,
+        admixture_phase2_prob_mul: float = 1.0,
+        assortative_temperature: float = float("inf"),
     ):
         self.pop_max = int(pop_max)
         self.rng = rng
@@ -377,6 +444,17 @@ class Population:
         self._acc_not_n = np.zeros(self.pop_max, dtype=np.int32)
         self._acc_and_hits = np.zeros(self.pop_max, dtype=np.int32)
         self._acc_not_hits = np.zeros(self.pop_max, dtype=np.int32)
+        # SPEC_L2_V3.5c — hard-row only ring buffers (per agent).
+        # _acc_and_hard_buf[slot, k] = 1 if the slot was correct on the k-th most
+        # recent (1,1)-AND window it personally observed, else 0.  _hard_n is
+        # min(samples_seen, LOGIC_HARD_HISTORY).  _hard_idx is the next slot to
+        # overwrite (FIFO).  Same layout for NOT (a=0).
+        self._acc_and_hard_buf = np.zeros((self.pop_max, LOGIC_HARD_HISTORY), dtype=np.int8)
+        self._acc_not_hard_buf = np.zeros((self.pop_max, LOGIC_HARD_HISTORY), dtype=np.int8)
+        self._acc_and_hard_n = np.zeros(self.pop_max, dtype=np.int32)
+        self._acc_not_hard_n = np.zeros(self.pop_max, dtype=np.int32)
+        self._acc_and_hard_idx = np.zeros(self.pop_max, dtype=np.int32)
+        self._acc_not_hard_idx = np.zeros(self.pop_max, dtype=np.int32)
         self._last_oracle = None  # OracleSample | None
         self._last_consensus_bit: int | None = None
         self._last_consensus_acc: float = 0.0
@@ -394,11 +472,75 @@ class Population:
         self._row_buf_idx = np.zeros(N_ROW_BUCKETS, dtype=np.int32)
         self._row_buf_filled = np.zeros(N_ROW_BUCKETS, dtype=bool)
         self._last_row_acc: list[float] = [0.0] * N_ROW_BUCKETS
+        # SPEC_L2_V3.5b — parallel buffers that only count on-niche voters
+        # (AND/dual experts on AND windows, NOT/dual experts on NOT windows).
+        # Same shape / index as the legacy buffers; the row index function is
+        # shared.  When voters_swarm == 0 the window is silently skipped.
+        self._row_buf_correct_swarm = np.zeros(
+            (N_ROW_BUCKETS, ROW_HISTORY), dtype=np.int32
+        )
+        self._row_buf_total_swarm = np.zeros(
+            (N_ROW_BUCKETS, ROW_HISTORY), dtype=np.int32
+        )
 
-        # SPEC_L2_V3.0 §1.4 — admixture window state.
-        self.admixture_window_s = float(max(0.0, admixture_window_s))
-        self.admixture_hgt_multiplier = float(max(1.0, admixture_hgt_multiplier))
+        # SPEC_L2_V3.4 — 3-phase admixture protocol.  Replaces the v3.0
+        # "single window with HGT boost" model that turned out to be
+        # ecologically backwards: bursting HGT *immediately* on contact
+        # means the dominant strain (typically the one with larger weight
+        # magnitudes) sweeps the population in seconds, eliminating the
+        # competing trait before recombination can produce dual-logic
+        # hybrids.  v3.4 mirrors the actual sequence in microbial
+        # admixture experiments (e.g. Lenski two-strain coexistence,
+        # Synechococcus / Prochlorococcus oceanic mixing):
+        #
+        #   Phase 1 — Commensal (0 .. commensal_s):
+        #       HGT *off entirely*.  Both founder strains share the same
+        #       dish but their gene pools stay isolated.  Selection acts
+        #       within each strain on its own metabolic regime; both
+        #       strains learn to survive in the new mixed environment.
+        #
+        #   Phase 2 — Controlled exchange (commensal_s .. commensal_s + exchange_s):
+        #       HGT enabled but with a *small* blend ratio (default 0.05
+        #       vs. baseline 0.30).  Models bacterial conjugation /
+        #       transformation: each event transfers a few genes, not a
+        #       weighted average of two whole genomes.  Strong-magnitude
+        #       weights from one strain no longer dilute their counter-
+        #       parts on the other side; small per-event transfers give
+        #       evolution many tries to find useful crossovers.
+        #
+        #   Phase 3 — Restored (t ≥ commensal_s + exchange_s):
+        #       HGT returns to the colony's baseline blend / prob.
+        #       The protocol's "first contact" period is over; the
+        #       population behaves like an ordinary colony from here.
+        #
+        # See docs/SPEC_L2_V3.0_admixture.md §V3.4 + project-summary §5.12
+        # for the rationale and the diagnostic that motivated the change.
+        self.admixture_commensal_s = float(max(0.0, admixture_commensal_s))
+        self.admixture_exchange_s = float(max(0.0, admixture_exchange_s))
+        self.admixture_phase2_blend = float(
+            min(1.0, max(0.0, admixture_phase2_blend))
+        )
+        self.admixture_phase2_prob_mul = float(max(0.0, admixture_phase2_prob_mul))
         self._t_sim_seconds = 0.0
+
+        # SPEC_L2_V3.5 — assortative HGT (prezygotic isolation by niche).
+        # ∞ → bit-identical to v3.4 ("richest neighbour wins"); finite values
+        # weight donor sampling by exp(-|Δniche|/T) so AND-experts preferentially
+        # share genes with AND-experts and NOT with NOT.  See docs/SPEC_L2_V3.5.
+        self.assortative_temperature = float(assortative_temperature)
+        # Swarm-level dual-logic telemetry caches.
+        self._last_species_counts: dict[int, int] = {
+            SPECIES_NOVICE: 0,
+            SPECIES_AND_EXPERT: 0,
+            SPECIES_NOT_EXPERT: 0,
+            SPECIES_DUAL_EXPERT: 0,
+        }
+        self._last_acc_and_swarm: float = 0.0
+        self._last_acc_not_swarm: float = 0.0
+        self._last_consensus_acc_swarm: float = 0.0
+        self._last_consensus_bit_swarm: int | None = None
+        self._last_consensus_voters_swarm: int = 0
+        self._last_colony_dual_acc: float = 0.0
 
         if self.slime.enabled:
             init_xy = random_positions(self.rng, self.pop_max, self.slime.grid_size)
@@ -510,6 +652,12 @@ class Population:
         self._acc_not_n[slot] = 0
         self._acc_and_hits[slot] = 0
         self._acc_not_hits[slot] = 0
+        self._acc_and_hard_buf[slot].fill(0)
+        self._acc_not_hard_buf[slot].fill(0)
+        self._acc_and_hard_n[slot] = 0
+        self._acc_not_hard_n[slot] = 0
+        self._acc_and_hard_idx[slot] = 0
+        self._acc_not_hard_idx[slot] = 0
 
     def spawn_initial_slot(self, slot: int) -> None:
         self.alive[slot] = True
@@ -652,13 +800,24 @@ class Population:
         return 0.0
 
     def _record_row_window(
-        self, mode: int, bit_a: int, bit_b: int, n_correct: int, n_total: int
+        self,
+        mode: int,
+        bit_a: int,
+        bit_b: int,
+        n_correct: int,
+        n_total: int,
+        n_correct_swarm: int = 0,
+        n_total_swarm: int = 0,
     ) -> None:
         """Population-level: record one window's (n_correct, n_total) on row (mode, a, b).
 
         This is the data source for the "1∧1 真学会率" / "NOT 0 真学会率"
         dashboard widgets — the only way to tell genuine learning apart
         from the silent attractor.
+
+        SPEC_L2_V3.5b: ``n_*_swarm`` mirrors the same row but counts only
+        on-niche voters (AND/dual experts on AND windows, NOT/dual on NOT).
+        Both buffers advance the same ring index so they stay aligned.
         """
         if n_total <= 0:
             return
@@ -666,6 +825,8 @@ class Population:
         idx = int(self._row_buf_idx[b])
         self._row_buf_correct[b, idx] = int(n_correct)
         self._row_buf_total[b, idx] = int(n_total)
+        self._row_buf_correct_swarm[b, idx] = int(max(0, n_correct_swarm))
+        self._row_buf_total_swarm[b, idx] = int(max(0, n_total_swarm))
         self._row_buf_idx[b] = (idx + 1) % ROW_HISTORY
         if idx + 1 >= ROW_HISTORY:
             self._row_buf_filled[b] = True
@@ -684,12 +845,116 @@ class Population:
             cor = int(self._row_buf_correct[b, :n].sum())
         return (cor / tot) if tot > 0 else 0.0
 
+    def _row_acc_swarm(self, mode: int, bit_a: int, bit_b: int) -> float:
+        """Same as :meth:`_row_acc` but only on-niche voters contribute.
+
+        Returns 0.0 when no on-niche voter has answered this row yet (i.e.
+        the relevant species hasn't emerged).  Frontends should treat that
+        as 'no data' rather than 'failed'.
+        """
+        b = _row_bucket(mode, bit_a, bit_b)
+        if self._row_buf_filled[b]:
+            tot = int(self._row_buf_total_swarm[b].sum())
+            cor = int(self._row_buf_correct_swarm[b].sum())
+        else:
+            n = int(self._row_buf_idx[b])
+            if n == 0:
+                return 0.0
+            tot = int(self._row_buf_total_swarm[b, :n].sum())
+            cor = int(self._row_buf_correct_swarm[b, :n].sum())
+        return (cor / tot) if tot > 0 else 0.0
+
+    def _row_n_samples_swarm(self, mode: int, bit_a: int, bit_b: int) -> int:
+        """How many on-niche voter samples are in the ring for row (mode, a, b)."""
+        b = _row_bucket(mode, bit_a, bit_b)
+        if self._row_buf_filled[b]:
+            return int(self._row_buf_total_swarm[b].sum())
+        n = int(self._row_buf_idx[b])
+        if n == 0:
+            return 0
+        return int(self._row_buf_total_swarm[b, :n].sum())
+
     def _row_n_samples(self, mode: int, bit_a: int, bit_b: int) -> int:
         """How many windows of row (mode, a, b) are in the ring (for UI confidence display)."""
         b = _row_bucket(mode, bit_a, bit_b)
         return int(ROW_HISTORY if self._row_buf_filled[b] else self._row_buf_idx[b])
 
-    def _record_logic_window(self, slot: int, mode: int, correct: bool) -> None:
+    # ── SPEC_L2_V3.5 — niche / species classification ──────────────────────
+
+    def _niche_slot(self, slot: int) -> float:
+        """Per-agent niche scalar in [-1, +1]: acc_AND - acc_NOT.
+
+        + 1 ⇒ pure AND-expert; -1 ⇒ pure NOT-expert; 0 ⇒ generalist (or
+        untrained novice — caller should check sample counts via
+        ``_species_of_slot`` if it needs to distinguish those).
+        """
+        return float(
+            self._logic_acc_slot(slot, MODE_AND)
+            - self._logic_acc_slot(slot, MODE_NOT)
+        )
+
+    def _species_of_slot(self, slot: int) -> int:
+        """Classify one living agent into the four species quadrants.
+
+        SPEC_L2_V3.5 §2 + SPEC_L2_V3.5c hard-row qualification.
+
+        An agent counts as AND_EXPERT only if **both** hold:
+          * General per-mode rolling accuracy ≥ NICHE_SPECIALIST_THRESHOLD with
+            ≥ NICHE_MIN_SAMPLES of evidence (the original v3.5 bar), AND
+          * Hard-row rolling accuracy on (1,1)-AND windows ≥
+            NICHE_HARD_THRESHOLD with ≥ NICHE_HARD_MIN_SAMPLES of those
+            specific windows (the v3.5c "actually fires when needed" bar).
+
+        Same dual-bar applies to NOT_EXPERT against the (a=0)-NOT row.
+
+        Rationale: under task_difficulty=balanced the easy target=0 rows
+        give a 50 % floor for free, which lets a half-firing agent slip past
+        the 0.65 mode bar.  Adding the hard-row bar refuses the free pass —
+        the agent must demonstrate it can actually produce '1' on the row
+        that demands it, not just stay silent on the easy zeros.
+        """
+        n_and = int(self._acc_and_n[slot])
+        n_not = int(self._acc_not_n[slot])
+        n_and_hard = int(self._acc_and_hard_n[slot])
+        n_not_hard = int(self._acc_not_hard_n[slot])
+        and_ok = (
+            n_and >= NICHE_MIN_SAMPLES
+            and self._logic_acc_slot(slot, MODE_AND) >= NICHE_SPECIALIST_THRESHOLD
+            and n_and_hard >= NICHE_HARD_MIN_SAMPLES
+            and self._logic_hard_acc_slot(slot, MODE_AND) >= NICHE_HARD_THRESHOLD
+        )
+        not_ok = (
+            n_not >= NICHE_MIN_SAMPLES
+            and self._logic_acc_slot(slot, MODE_NOT) >= NICHE_SPECIALIST_THRESHOLD
+            and n_not_hard >= NICHE_HARD_MIN_SAMPLES
+            and self._logic_hard_acc_slot(slot, MODE_NOT) >= NICHE_HARD_THRESHOLD
+        )
+        if and_ok and not_ok:
+            return SPECIES_DUAL_EXPERT
+        if and_ok:
+            return SPECIES_AND_EXPERT
+        if not_ok:
+            return SPECIES_NOT_EXPERT
+        return SPECIES_NOVICE
+
+    def _niche_array_living(self, alive_idx: np.ndarray) -> np.ndarray:
+        """Vector of niche scalars (acc_AND - acc_NOT) aligned to `alive_idx`."""
+        out = np.zeros(alive_idx.size, dtype=np.float64)
+        for j, s in enumerate(alive_idx.tolist()):
+            out[j] = self._niche_slot(int(s))
+        return out
+
+    def _record_logic_window(
+        self, slot: int, mode: int, correct: bool, target_bit: int = 0
+    ) -> None:
+        """Record one window's (slot, mode, correct) into the rolling buffers.
+
+        SPEC_L2_V3.5c — also records a separate "hard-row" buffer when
+        ``target_bit == 1`` (the rows that require the agent to actually fire:
+        (1,1)-AND and (a=0)-NOT).  These hard buffers are used by
+        :meth:`_species_of_slot` to filter out silent-pretender specialists.
+        The general per-mode buffer is unchanged.
+        """
         if mode == MODE_AND:
             n = int(self._acc_and_n[slot])
             idx = n % LOGIC_HISTORY
@@ -710,6 +975,41 @@ class Population:
             else:
                 self._acc_not_hits[slot] = int(self._acc_not_hits[slot]) + (1 if correct else 0)
                 self._acc_not_n[slot] = n + 1
+
+        if int(target_bit) == 1:
+            if mode == MODE_AND:
+                hard_idx = int(self._acc_and_hard_idx[slot])
+                self._acc_and_hard_buf[slot, hard_idx] = 1 if correct else 0
+                self._acc_and_hard_idx[slot] = (hard_idx + 1) % LOGIC_HARD_HISTORY
+                if int(self._acc_and_hard_n[slot]) < LOGIC_HARD_HISTORY:
+                    self._acc_and_hard_n[slot] = int(self._acc_and_hard_n[slot]) + 1
+            else:
+                hard_idx = int(self._acc_not_hard_idx[slot])
+                self._acc_not_hard_buf[slot, hard_idx] = 1 if correct else 0
+                self._acc_not_hard_idx[slot] = (hard_idx + 1) % LOGIC_HARD_HISTORY
+                if int(self._acc_not_hard_n[slot]) < LOGIC_HARD_HISTORY:
+                    self._acc_not_hard_n[slot] = int(self._acc_not_hard_n[slot]) + 1
+
+    def _logic_hard_acc_slot(self, slot: int, mode: int) -> float:
+        """Per-slot rolling accuracy on the *hard* row only (target_bit=1).
+
+        Returns 0.0 when no hard-row evidence has been observed yet.
+        """
+        if mode == MODE_AND:
+            n = int(self._acc_and_hard_n[slot])
+            if n <= 0:
+                return 0.0
+            return float(self._acc_and_hard_buf[slot, :n].sum()) / float(n)
+        n = int(self._acc_not_hard_n[slot])
+        if n <= 0:
+            return 0.0
+        return float(self._acc_not_hard_buf[slot, :n].sum()) / float(n)
+
+    def _logic_hard_n_slot(self, slot: int, mode: int) -> int:
+        """Number of hard-row windows observed by this slot in current life."""
+        if mode == MODE_AND:
+            return int(self._acc_and_hard_n[slot])
+        return int(self._acc_not_hard_n[slot])
 
     def global_sigma(self) -> float:
         idx = self.living_indices()
@@ -845,7 +1145,7 @@ class Population:
                 ob = classify_output(float(f_outs[j]))
                 out_bits[j] = ob
                 correct = (ob == oracle.target_bit)
-                self._record_logic_window(slot, oracle.mode, correct)
+                self._record_logic_window(slot, oracle.mode, correct, oracle.target_bit)
                 if correct:
                     rewards[j] = oracle.reward_correct
                     n_correct += 1
@@ -874,13 +1174,52 @@ class Population:
             self._last_consensus_bit = consensus_bit
             self._last_consensus_acc = consensus_acc
 
+            # SPEC_L2_V3.5b — niche-aware consensus.  Only agents whose niche
+            # matches the current oracle mode (AND-experts or dual-experts on
+            # AND windows; NOT-experts or dual on NOT windows) get a vote.
+            # When zero on-niche voters exist (e.g. early evolution, or one
+            # specialist niche extinct), we surface (None, 0) so the UI can
+            # render "尚无 X 专家" rather than mis-counting silent off-niche
+            # voters as "abstaining yes".
+            n_correct_swarm = 0
+            n_voters_swarm = 0
+            spiking_swarm = 0
+            if n_alive > 0:
+                want_and = (oracle.mode == MODE_AND)
+                for j, slot in enumerate(idx.tolist()):
+                    sp = self._species_of_slot(int(slot))
+                    if sp == SPECIES_DUAL_EXPERT or (
+                        want_and and sp == SPECIES_AND_EXPERT
+                    ) or (
+                        (not want_and) and sp == SPECIES_NOT_EXPERT
+                    ):
+                        n_voters_swarm += 1
+                        if int(out_bits[j]) == oracle.target_bit:
+                            n_correct_swarm += 1
+                        if int(out_bits[j]) == 1:
+                            spiking_swarm += 1
+            if n_voters_swarm > 0:
+                consensus_bit_swarm = (
+                    1 if spiking_swarm >= (n_voters_swarm - spiking_swarm) else 0
+                )
+                consensus_acc_swarm = float(n_correct_swarm / n_voters_swarm)
+            else:
+                consensus_bit_swarm = None
+                consensus_acc_swarm = 0.0
+            self._last_consensus_acc_swarm = consensus_acc_swarm
+            self._last_consensus_bit_swarm = consensus_bit_swarm
+            self._last_consensus_voters_swarm = int(n_voters_swarm)
+
             # Population-level per-row accuracy (the "真学会" gauge data).
             # n_correct already counted above; record it against this window's
-            # specific (mode, a, b) row.
+            # specific (mode, a, b) row.  n_*_swarm threads niche-aware tallies
+            # into the parallel ring buffer.
             if n_alive > 0:
                 self._record_row_window(
                     oracle.mode, oracle.bit_a, oracle.bit_b,
                     n_correct=n_correct, n_total=n_alive,
+                    n_correct_swarm=n_correct_swarm,
+                    n_total_swarm=n_voters_swarm,
                 )
 
             # Budget mode is intentionally a no-op for L2v2 — the reward table
@@ -942,17 +1281,22 @@ class Population:
             r_mean = 0.0
 
         # ── Slime: horizontal gene transfer (social, lateral learning) ──
-        # SPEC_L2_V3.0 §1.4: during the admixture window, boost hgt_prob ×N
-        # to model the brief gene-exchange burst when two cultures first meet.
-        in_admixture_window = (
-            self.admixture_window_s > 0.0
-            and self._t_sim_seconds < self.admixture_window_s
-        )
-        eff_hgt_prob = (
-            min(1.0, self.slime.hgt_prob * self.admixture_hgt_multiplier)
-            if in_admixture_window
-            else self.slime.hgt_prob
-        )
+        # SPEC_L2_V3.4 — 3-phase admixture protocol (see __init__ comment).
+        # phase==1 → HGT entirely skipped (commensal isolation).
+        # phase==2 → HGT enabled with reduced blend (controlled exchange).
+        # phase==3 → baseline HGT (post-admixture, normal colony life).
+        admix_phase = self._admixture_phase()
+        if admix_phase == 1:
+            eff_hgt_prob = 0.0
+            eff_hgt_blend = 0.0
+        elif admix_phase == 2:
+            eff_hgt_prob = min(
+                1.0, self.slime.hgt_prob * self.admixture_phase2_prob_mul
+            )
+            eff_hgt_blend = self.admixture_phase2_blend
+        else:
+            eff_hgt_prob = self.slime.hgt_prob
+            eff_hgt_blend = self.slime.hgt_blend
         hgt_count = 0
         hgt_pair_log: list[tuple[int, int]] = []
         if (
@@ -963,6 +1307,17 @@ class Population:
         ):
             pos_alive = self.positions[idx]
             cred_alive = self.credit[idx].copy()
+            # SPEC_L2_V3.5 — only compute the niche vector when assortative HGT
+            # is actually requested (finite temperature).  Default ∞ keeps the
+            # call signature legacy-equivalent for L1 and v3.4 colonies.
+            niche_alive: np.ndarray | None
+            if (
+                self.task == TASK_L2V2
+                and np.isfinite(self.assortative_temperature)
+            ):
+                niche_alive = self._niche_array_living(idx)
+            else:
+                niche_alive = None
             pairs = hgt_pairs(
                 self.rng,
                 pos_alive,
@@ -971,6 +1326,8 @@ class Population:
                 self.slime.hgt_radius,
                 eff_hgt_prob,
                 self.slime.hgt_donor_ratio,
+                niche=niche_alive,
+                assortative_temperature=self.assortative_temperature,
             )
             for r_local, d_local in pairs:
                 r_slot = int(idx[r_local])
@@ -980,7 +1337,7 @@ class Population:
                 if self.credit[r_slot] <= self.slime.hgt_cost:
                     continue
                 self.weights[r_slot] = blend_weights(
-                    self.weights[r_slot], self.weights[d_slot], self.slime.hgt_blend
+                    self.weights[r_slot], self.weights[d_slot], eff_hgt_blend
                 )
                 self.credit[r_slot] -= self.slime.hgt_cost
                 # Recipient was modified — flush its history; old (f_in, f_out) no longer
@@ -1094,15 +1451,70 @@ class Population:
                 logic_diversity = float(
                     1.0 - abs(acc_and_pop - acc_not_pop) / denom
                 )
+                # SPEC_L2_V3.5 — species classification + niche-aware swarm
+                # metrics.  After the v3.4 admixture failure (§5.12) we accept
+                # that L2 dual-logic does NOT have to live in a single agent;
+                # instead it can live in the colony as a community of two
+                # specialists.  These metrics measure exactly that.
+                species_counts: dict[int, int] = {
+                    SPECIES_NOVICE: 0,
+                    SPECIES_AND_EXPERT: 0,
+                    SPECIES_NOT_EXPERT: 0,
+                    SPECIES_DUAL_EXPERT: 0,
+                }
+                # Two votes-by-niche means: AND-experts (incl. dual) vote on AND,
+                # NOT-experts (incl. dual) vote on NOT.  Generalists / novices do
+                # NOT vote — they're not authorities on either question, and
+                # including them is what the v3.0 acc_*_pop metric does wrong.
+                and_voters_acc: list[float] = []
+                not_voters_acc: list[float] = []
+                for s_int in alive_idx.tolist():
+                    s = int(s_int)
+                    sp = self._species_of_slot(s)
+                    species_counts[sp] += 1
+                    if sp == SPECIES_AND_EXPERT or sp == SPECIES_DUAL_EXPERT:
+                        and_voters_acc.append(self._logic_acc_slot(s, MODE_AND))
+                    if sp == SPECIES_NOT_EXPERT or sp == SPECIES_DUAL_EXPERT:
+                        not_voters_acc.append(self._logic_acc_slot(s, MODE_NOT))
+                acc_and_swarm = (
+                    float(np.mean(and_voters_acc)) if and_voters_acc else 0.0
+                )
+                acc_not_swarm = (
+                    float(np.mean(not_voters_acc)) if not_voters_acc else 0.0
+                )
+                # colony_dual_acc — the L2 SPEC_V3.5 success indicator.
+                # Defined only when BOTH species have ≥ NICHE_MIN_SAMPLES voters
+                # (otherwise the colony is monolithic and one species's metric is
+                # vacuously 0; reporting that as 0.5 × acc_specialist would lie).
+                if (
+                    len(and_voters_acc) >= NICHE_MIN_SAMPLES
+                    and len(not_voters_acc) >= NICHE_MIN_SAMPLES
+                ):
+                    colony_dual_acc = 0.5 * (acc_and_swarm + acc_not_swarm)
+                else:
+                    colony_dual_acc = 0.0
             else:
                 acc_and_pop = 0.0
                 acc_not_pop = 0.0
                 both_pass_pct = 0.0
                 logic_diversity = 0.0
+                species_counts = {
+                    SPECIES_NOVICE: 0,
+                    SPECIES_AND_EXPERT: 0,
+                    SPECIES_NOT_EXPERT: 0,
+                    SPECIES_DUAL_EXPERT: 0,
+                }
+                acc_and_swarm = 0.0
+                acc_not_swarm = 0.0
+                colony_dual_acc = 0.0
             self._last_acc_and_pop = acc_and_pop
             self._last_acc_not_pop = acc_not_pop
             self._last_both_pass_pct = both_pass_pct
             self._last_logic_diversity = logic_diversity
+            self._last_species_counts = species_counts
+            self._last_acc_and_swarm = acc_and_swarm
+            self._last_acc_not_swarm = acc_not_swarm
+            self._last_colony_dual_acc = colony_dual_acc
 
             # Cache row-specific accuracies for telemetry payload.
             # Index order matches _row_bucket(): AND(0,0), AND(0,1), AND(1,0),
@@ -1163,6 +1575,44 @@ class Population:
             "acc_not_pop": float(self._last_acc_not_pop) if self.task == TASK_L2V2 else 0.0,
             "both_pass_pct": float(self._last_both_pass_pct) if self.task == TASK_L2V2 else 0.0,
             "logic_diversity": float(self._last_logic_diversity) if self.task == TASK_L2V2 else 0.0,
+            # SPEC_L2_V3.5 — niche-aware swarm-level dual-logic metrics.
+            # acc_*_swarm = per-question-type expert vote (no novices/cross-pollution).
+            # colony_dual_acc = (acc_and_swarm + acc_not_swarm)/2, only defined when
+            # both species exist in sufficient numbers (else 0).
+            # species_counts gives the four-quadrant population breakdown.
+            "acc_and_swarm": (
+                float(self._last_acc_and_swarm) if self.task == TASK_L2V2 else 0.0
+            ),
+            "acc_not_swarm": (
+                float(self._last_acc_not_swarm) if self.task == TASK_L2V2 else 0.0
+            ),
+            "colony_dual_acc": (
+                float(self._last_colony_dual_acc) if self.task == TASK_L2V2 else 0.0
+            ),
+            "species_counts": (
+                {
+                    "novice": int(self._last_species_counts.get(SPECIES_NOVICE, 0)),
+                    "and_expert": int(self._last_species_counts.get(SPECIES_AND_EXPERT, 0)),
+                    "not_expert": int(self._last_species_counts.get(SPECIES_NOT_EXPERT, 0)),
+                    "dual_expert": int(self._last_species_counts.get(SPECIES_DUAL_EXPERT, 0)),
+                }
+                if self.task == TASK_L2V2
+                else None
+            ),
+            "assortative_temperature": float(self.assortative_temperature),
+            # SPEC_L2_V3.5b — niche-aware consensus.  consensus_acc_swarm is
+            # the "ask only the matching specialists" version of consensus_acc;
+            # consensus_voters_swarm tells the UI how many on-niche voters
+            # backed it (0 = no specialists exist yet, treat as 'no data').
+            "consensus_acc_swarm": (
+                float(self._last_consensus_acc_swarm) if self.task == TASK_L2V2 else 0.0
+            ),
+            "consensus_bit_swarm": (
+                self._last_consensus_bit_swarm if self.task == TASK_L2V2 else None
+            ),
+            "consensus_voters_swarm": (
+                int(self._last_consensus_voters_swarm) if self.task == TASK_L2V2 else 0
+            ),
             # Row-specific accuracy & sample-count (the "真学会" telemetry).
             # acc_and_11_pop is the headline gauge — silent agents are pinned at 0
             # here even when混合 acc_and_pop sits at the silent ceiling (75%/50%).
@@ -1171,6 +1621,14 @@ class Population:
             ),
             "acc_not_0_pop": (
                 float(self._row_acc(MODE_NOT, 0, 0)) if self.task == TASK_L2V2 else 0.0
+            ),
+            # SPEC_L2_V3.5b — same headline rows but only on-niche voters
+            # contribute, so the silent-majority dilution disappears.
+            "acc_and_11_swarm": (
+                float(self._row_acc_swarm(MODE_AND, 1, 1)) if self.task == TASK_L2V2 else 0.0
+            ),
+            "acc_not_0_swarm": (
+                float(self._row_acc_swarm(MODE_NOT, 0, 0)) if self.task == TASK_L2V2 else 0.0
             ),
             # All 6 rows + sample counts, for the detailed truth-table widget.
             "row_acc": (
@@ -1197,16 +1655,65 @@ class Population:
                 if self.task == TASK_L2V2
                 else None
             ),
+            # SPEC_L2_V3.5b — niche-aware row accuracies + voter counts.
+            # row_acc_swarm["and_11"] is the *real* headline ('AND-experts get
+            # 1∧1 = 1') — only the matching species' votes count, so silent
+            # off-niche agents stop dragging the average toward 50%.
+            "row_acc_swarm": (
+                {
+                    "and_00": float(self._row_acc_swarm(MODE_AND, 0, 0)),
+                    "and_01": float(self._row_acc_swarm(MODE_AND, 0, 1)),
+                    "and_10": float(self._row_acc_swarm(MODE_AND, 1, 0)),
+                    "and_11": float(self._row_acc_swarm(MODE_AND, 1, 1)),
+                    "not_a0": float(self._row_acc_swarm(MODE_NOT, 0, 0)),
+                    "not_a1": float(self._row_acc_swarm(MODE_NOT, 1, 0)),
+                }
+                if self.task == TASK_L2V2
+                else None
+            ),
+            "row_n_swarm": (
+                {
+                    "and_00": int(self._row_n_samples_swarm(MODE_AND, 0, 0)),
+                    "and_01": int(self._row_n_samples_swarm(MODE_AND, 0, 1)),
+                    "and_10": int(self._row_n_samples_swarm(MODE_AND, 1, 0)),
+                    "and_11": int(self._row_n_samples_swarm(MODE_AND, 1, 1)),
+                    "not_a0": int(self._row_n_samples_swarm(MODE_NOT, 0, 0)),
+                    "not_a1": int(self._row_n_samples_swarm(MODE_NOT, 1, 0)),
+                }
+                if self.task == TASK_L2V2
+                else None
+            ),
             "task_difficulty": (
                 str(self.task_difficulty) if self.task == TASK_L2V2 else None
             ),
-            # SPEC_L2_V3.0 §1.4 — admixture window state (UI uses this to show
-            # a "杂交期 still active, t/T s remaining" indicator + boosted HGT).
-            "admixture_active": bool(in_admixture_window),
-            "admixture_window_s": float(self.admixture_window_s),
-            "admixture_hgt_multiplier": float(self.admixture_hgt_multiplier),
+            # SPEC_L2_V3.4 — 3-phase admixture telemetry (UI shows phase pill,
+            # remaining seconds, current effective HGT params).
+            "admixture_phase": int(admix_phase),  # 1 = commensal, 2 = exchange, 3 = restored
+            "admixture_active": bool(admix_phase in (1, 2)),
+            "admixture_commensal_s": float(self.admixture_commensal_s),
+            "admixture_exchange_s": float(self.admixture_exchange_s),
+            "admixture_phase2_blend": float(self.admixture_phase2_blend),
+            "admixture_phase2_prob_mul": float(self.admixture_phase2_prob_mul),
             "eff_hgt_prob": float(eff_hgt_prob),
+            "eff_hgt_blend": float(eff_hgt_blend),
         }
+
+    def _admixture_phase(self) -> int:
+        """SPEC_L2_V3.4 — return current admixture phase (1, 2, or 3).
+
+        - 1 = Commensal (HGT off): t < commensal_s
+        - 2 = Controlled exchange (low blend): commensal_s ≤ t < commensal_s + exchange_s
+        - 3 = Restored (baseline HGT): t ≥ commensal_s + exchange_s, OR
+              the protocol was never activated (commensal_s == exchange_s == 0).
+        """
+        if self.admixture_commensal_s <= 0.0 and self.admixture_exchange_s <= 0.0:
+            return 3  # protocol disabled — colony runs on baseline HGT from t=0
+        t = self._t_sim_seconds
+        if t < self.admixture_commensal_s:
+            return 1
+        if t < self.admixture_commensal_s + self.admixture_exchange_s:
+            return 2
+        return 3
 
     def weight_diversity_metric(self) -> float:
         """Mean over weight positions of std across living agents (SPEC §8.1)."""
@@ -1239,6 +1746,75 @@ class Population:
         # In L2v2 fitness is mean(acc_AND, acc_NOT) ∈ [0, 1]; 0.7 ≈ "elite both-pass".
         # In L1 fitness is Pearson r ∈ [-1, 1]; 0.7 is the SPEC §6 success threshold.
         return self.max_fitness() >= 0.7
+
+    def top_k_slots_by_niche(
+        self,
+        k: int,
+        niche: str,
+    ) -> np.ndarray:
+        """SPEC_L2_V3.5b — pick top-K agents that match a niche.
+
+        ``niche`` ∈ {"and_expert", "not_expert", "dual_expert", "any_expert"}.
+
+        Filtering is by :meth:`_species_of_slot` (uses rolling per-mode
+        accuracy + min-sample threshold).  Within the matching set agents
+        are ranked by per-mode accuracy of the relevant mode (rather than
+        the global fitness average), so e.g. asking for ``and_expert``
+        returns the agents that are *most* accurate on AND, not the ones
+        with the highest mean(acc_AND, acc_NOT).
+
+        Returns an empty array when no agent matches the niche — callers
+        (Use page, 6-题考试) should fall back to ``top_k_slots`` and warn
+        the user that the colony lacks that specialist.
+        """
+        idx = self.living_indices()
+        if idx.size == 0:
+            return idx
+
+        # SPEC_L2_V3.5c — rank by *hard-row* accuracy (the row that proves the
+        # agent can actually fire on demand), with the general per-mode acc as
+        # tiebreaker.  This pushes silent-pretenders (which now don't even pass
+        # _species_of_slot's hard-row bar, but might if thresholds drift) to
+        # the bottom and surfaces the most useful experts to the Use page.
+        keep = []
+        scores = []
+        for s in idx.tolist():
+            slot = int(s)
+            sp = self._species_of_slot(slot)
+            if niche == "and_expert":
+                ok = sp in (SPECIES_AND_EXPERT, SPECIES_DUAL_EXPERT)
+                rank = (
+                    0.7 * self._logic_hard_acc_slot(slot, MODE_AND)
+                    + 0.3 * self._logic_acc_slot(slot, MODE_AND)
+                )
+            elif niche == "not_expert":
+                ok = sp in (SPECIES_NOT_EXPERT, SPECIES_DUAL_EXPERT)
+                rank = (
+                    0.7 * self._logic_hard_acc_slot(slot, MODE_NOT)
+                    + 0.3 * self._logic_acc_slot(slot, MODE_NOT)
+                )
+            elif niche == "dual_expert":
+                ok = sp == SPECIES_DUAL_EXPERT
+                rank = 0.5 * (
+                    0.7 * self._logic_hard_acc_slot(slot, MODE_AND)
+                    + 0.3 * self._logic_acc_slot(slot, MODE_AND)
+                    + 0.7 * self._logic_hard_acc_slot(slot, MODE_NOT)
+                    + 0.3 * self._logic_acc_slot(slot, MODE_NOT)
+                )
+            elif niche == "any_expert":
+                ok = sp != SPECIES_NOVICE
+                rank = self._fitness_slot(slot) if self._fitness_defined(slot) else -1.0
+            else:
+                raise ValueError(f"unknown niche: {niche}")
+            if ok:
+                keep.append(slot)
+                scores.append(float(rank))
+        if not keep:
+            return np.empty(0, dtype=idx.dtype)
+        keep_arr = np.asarray(keep, dtype=idx.dtype)
+        order = np.argsort(np.asarray(scores), kind="stable")[::-1]
+        pick = order[: min(k, order.size)]
+        return keep_arr[pick]
 
     def top_k_slots(self, k: int, by: str = "fitness") -> np.ndarray:
         idx = self.living_indices()

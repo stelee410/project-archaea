@@ -365,6 +365,182 @@ Hidden 10..19 = S-tonic drivers:
 
 哲学注脚（用户提出）：D1 印证了一个被 RNA-world / Maxwell's demon / 柯尔莫哥洛夫复杂度反复给出的结论——**演化不是从无到有的信息创造，而是已有信息的精炼**。"原罪"这个比喻挺贴切：那个非选择得来的、却又是后续一切选择得以发生的初始结构，必须有人付了那笔信息税。在我们这里，那个"原罪"就是 D1 写在 founder DNA 里的反跟随拓扑。
 
+### 5.12 ERRATA v3.4：admixture 必须分相 — 单窗口爆发会被强幅值菌株单边扫荡
+
+**症状**：D1 NOT 学家（acc_NOT≈0.92）和成熟 AND 学家（acc_AND≈0.85）按 50/50 倒进同一杂交皿，按 v3.0 的"前 N 秒 HGT × 5"协议跑 5 分钟后：
+
+- `acc_not_pop` 维持在 0.92（NOT 表型完全保留）
+- `acc_and_11_pop` 从 0.85 暴跌到 0.27（AND 表型几乎消失）
+- 整个种群被 NOT 单边扫荡，**双修个体没机会诞生**
+
+**诊断**：HGT 用 `blend_weights(w_recipient, w_donor, η=0.30)` 做凸组合：
+
+- D1 NOT 种子的强结构权重幅值 ±2~±5（人为设大，确保 founder 阶段一定能 fire）
+- AND 学家是自然演化出来的，权重幅值通常 ±0.5~±2
+- 当 NOT 学家做 donor 时，η=0.30 意味着 AND 学家的对应正权重一次就被
+  推到 `0.7 × +1.5 + 0.3 × (-4) = -0.15`——**直接翻号**，AND 逻辑当场失效
+- 反过来 AND 做 donor 时，弱幅值对 NOT 强结构种子的污染微乎其微
+- 加上 admixture 期 HGT × 5 的爆发，几十秒就完成种群扫荡
+
+这是 v3.0 §1.4 设计的致命错配：它假设两群强度对等、HGT blend 是中性的；
+事实上**强幅值菌株会单边污染弱幅值菌株**，越爆发越快垮。
+
+**生物学反思**：v3.0 的"立即放大基因流"恰恰和真实双菌共栖相反。Lenski LTEE
+两菌共培养、Synechococcus / Prochlorococcus 海洋混合的标准节奏是：**长共栖期 → 偶发低强度 HGT → 才出现观测得到的杂交个体**。HGT 单次转移的基因量很小（几个 ORF / 一段质粒），从来不是"半个基因组的加权平均"。
+
+**修复（SPEC_L2_V3.4）**：把单窗口模型替换成 3 相生态协议：
+
+| 阶段 | 时长（默认） | HGT prob | HGT blend |
+|---|---|---|---|
+| ① Commensal（共栖期） | 60s | 0（关闭） | — |
+| ② Controlled exchange（受控交换期） | 120s | 基线 × 1.0 | **0.05**（基线 0.30 的 1/6） |
+| ③ Restored（恢复期） | ∞ | 基线 | 基线（0.30） |
+
+实现：`Population` 用 `_admixture_phase()` 按 `_t_sim_seconds` 判别当前
+phase；HGT 块按 phase 分发——phase 1 直接跳过，phase 2 用 `phase2_blend`
+覆盖 `slime.hgt_blend`，phase 3 走原始路径。Telemetry 暴露 `admixture_phase`
+和当前 `eff_hgt_blend / eff_hgt_prob`，UI（StrainBar）按 phase 渲染不同
+徽章——青色 = ① 共栖期、洋红脉动 = ② 受控交换期。
+
+**关键设计动机**：
+
+- **Phase 1 没有 HGT** 不是简单的"延迟"，是给两个 founder 群体独立完成
+  founder collapse 抗性测试的窗口——确认两群在新难度预设下都能存活，
+  然后才有资格交换。
+- **Phase 2 的 η=0.05** 才是真正的修复点：即使 D1 强负权重被转移给 AND
+  学家，每次只把对方权重拉低 5%，**不会翻号**。给演化足够多的尝试次数找
+  "保留两边表型的杂交"，而不是被一次大幅平均直接抹掉。
+- **`admixture_phase2_prob_mul = 1.0`**（不再放大）：phase 2 长达 120s，
+  即便基线 prob=0.02 也累积非常多次 HGT 事件，根本不需要爆发。
+
+参数 API 变化：`SimConfig.admixture_window_s` / `admixture_hgt_multiplier`
+**完全移除**，改为 `admixture_commensal_s` / `admixture_exchange_s` /
+`admixture_phase2_blend` / `admixture_phase2_prob_mul`。`POST /api/start`
+body 同步替换；MixerPage UI 重写为「共栖期 / 受控交换期 / phase2 blend /
+phase2 prob ×」四参数表单，底部固定显示「③ 恢复期，t ≥ X s」提示。
+
+代码足迹：
+- `population.py`：`__slots__` 4 个新字段；`__init__` 4 个新参数；新增
+  `_admixture_phase()` 方法；step_window 的 HGT 块按 phase 分发；
+  telemetry dict 6 个新字段（删 2 个旧字段）
+- `runtime.py`：`SimConfig` + `normalized()` + Population 注入 + telemetry
+  surface 全部替换
+- `server.py`：`StartBody` 4 个新 Pydantic 字段（带 ge/le 校验）
+- `tests/test_strain.py`：删 v3.0 的 2 个旧测试，补 6 个新测试覆盖
+  phase 1 关 HGT、phase 2 用 phase2_blend、phase 3 恢复基线、协议禁用、
+  phase 单调推进、blend=0 时 recipient 权重不变（验证 eff_blend 真的
+  接到了 `blend_weights` 调用上）
+- `webui/src/types.ts` + `MixerPage.tsx` + `StrainBar.tsx`：UI 同步
+- `docs/SPEC_L2_V3.0_admixture.md`：附 §7 ERRATA v3.4 完整 spec
+
+**生物对齐**：3 相协议直接对应实验生物学的 *neutrally-buffered cocultivation*
+范式——把两株共培养、先确认它们能在共享培养基里独立生长（commensal
+phase），然后才在受控条件下做基因交换实验（曝露质粒供体、转化感受态
+等）。我们没发明任何东西，只是把这套范式从 *E. coli* 实验台搬进了
+权重空间。
+
+**待观察**：phase 2 的 η=0.05 是否在所有 founder 强度配比下都够温和。
+如果未来发现仍有单边污染（比如某些 D1 种子幅值更大、或 AND 学家本身偏弱），
+下一步换"per-cell crossover"（每条权重独立从 donor / recipient 二选一抽样）
+——那是更接近真实细菌接合的离散基因转移模型。
+
+### 5.13 SPEC_L2_V3.5：放弃单细胞双修，接受物种共存（speciation）
+
+**症状**：v3.4 三相协议落地后，跑混合 sim：commensal=60s + exchange=120s + η=0.05。两个物种的命中率**双双下降**——AND 跌、NOT 也跌、`both_pass_pct` 还是 0。"both_drop"。
+
+**用户的洞察**（一击命中）：
+
+> 我在想，原因是不是 AND 和 NOT 的进化完全不一样，应该是生殖隔离，无法
+> 杂交，或者说杂交无意义。
+
+这是对的。从权重层观察：
+
+| 维度 | AND-学家（自然演化） | NOT-学家（D1 种子衍生） |
+|---|---|---|
+| 主导编码 | 分布式（多隐元小幅值正权重叠加） | 位置式（A-detector + S-tonic 双子电路） |
+| 典型幅值 | ±2 以内 | ±5 |
+| 关键结构 | 全兴奋通路 | 兴奋 + 抑制 + S 信号门控 |
+
+`blend_weights` 是凸组合，无论 η 多小，**只要权重符号不同、幅值悬殊，混血总是同时破坏两个父本的关键电路**。v3.4 的 η=0.05 让一次伤害变小，但累积起来仍把双方电路磨平——这就是经典生物学的**基因组不相容（genome incompatibility）**。
+
+**用户进一步的生物学映射**（直接采纳）：
+
+> 当两个功能完全不同且难以兼容的系统相遇时，它们走的不是融合，而是
+> 内共生 / 基因复制 / 物种分化。
+
+可选三条路径：
+
+1. **基因复制**——增加单 agent 的隐藏神经元数。重架构改动，与 SPEC v1.0 的 220 权重契约冲突，留给未来 L-level。
+2. **内共生**——多 agent 嵌套，host 调度 sub-network。与本仓 multi-agent 范式不一致。
+3. **物种分化**——两群独立物种共栖于同一菌落，<u>菌落整体</u>呈现复合逻辑能力。 ← **本次选择**。
+
+设计原则：
+
+> **群体即生命**。L2 的成功判据不是"找到一个能同时做 AND 和 NOT 的细胞"，
+> 而是"菌落里既有专做 AND 的居民、又有专做 NOT 的居民，且两类居民都能稳定再生产"。
+
+**修复（SPEC_L2_V3.5）三件套**：
+
+1. **Niche（生态位）= acc_AND − acc_NOT ∈ [-1, +1]**——一维标量，正端 = AND-专家，负端 = NOT-专家。
+2. **Assortative HGT（同类相吸基因流）**——`hgt_pairs()` 增加 `niche` + `assortative_temperature` 参数；候选 donor 仍按"半径 + credit"过滤，但最终通过 softmax 加权抽样，权重 ∝ exp(-|Δniche|/T)。
+   - `T = ∞`（默认 / null）：bit-identical to v3.4，挑最富裕者。
+   - `T → 0`：严格物种隔离，只有最近 niche 的同类能转入基因。
+   - `T = 0.30`（推荐）：柔性偏好——同物种几个数量级大于异物种概率，仍允许偶发跨界。
+3. **Niche-aware Consensus（专家投票）**——新指标：
+   - `acc_*_swarm`：只让对应 mode 的专家在该 mode 上的准确率均值（不再被 NOT 专家在 AND 题上的噪声污染）。
+   - `colony_dual_acc = (acc_AND_swarm + acc_NOT_swarm) / 2`，**仅当**两个物种各自至少有 10 个投票者且达到 0.65 阈值时才非零。
+   - 这才是 v3.5 真正的 L2 成功判据：一个 100% AND 的菌落 `colony_dual_acc = 0`，正确反映了"它没有完成 L2"。
+
+**物种四象限分类**（`Population._species_of_slot`）：NOVICE / AND_EXPERT / NOT_EXPERT / DUAL_EXPERT，阈值 `NICHE_SPECIALIST_THRESHOLD = 0.65` + `NICHE_MIN_SAMPLES = 10`。样本数门槛极重要：在 `and_only` 培养皿里 `_acc_not_n` 永远 0，"运气好的输出"不能算 NOT 能力。
+
+**API/UI 变化**：
+
+- `SimConfig.assortative_temperature: float | None = None`（None=legacy；JSON 友好）
+- 新 telemetry：`acc_and_swarm` / `acc_not_swarm` / `colony_dual_acc` / `species_counts: {novice, and_expert, not_expert, dual_expert}` / `assortative_temperature`
+- MixerPage：「物种隔离」section，三个一键预设（off / soft / strict）+ T 滑块 0..2，summary 加 `T_niche`
+- L2v2 Dashboard：新增「物种结构」面板——四色堆叠条 + 四象限计数 + 三个 swarm 徽章（colony_dual_acc 高亮 + 双物种状态文案切换）
+- 全部 121 个 pytest + tsc 通过；新增 `tests/test_speciation.py` 10 个 case 覆盖 assortative HGT 同源偏置、富裕 vs 同类二选一、legacy 兼容、物种四象限分类、样本不足→novice、telemetry emit、colony_dual_acc 单/双物种切换、SimConfig 圆环、Population 烟雾测试
+
+**生物对齐**：assortative HGT 直接对应**生殖前隔离（prezygotic isolation）**——配偶选择倾向于同物种，避免无效杂交。Niche-aware consensus 对应**生态位分化（ecological niche partitioning）**——一个生态系统的生产力由各专业户加和构成，不是"每个个体都什么都会"。
+
+**待观察**：T = 0.30 的默认值是否在不同 founder 比例下都稳定。如果未来某些极端配比下两个物种比例严重失衡（如 9:1），考虑在 MixerPage 加 founder-fraction-balanced 推荐。
+
+### 5.14 ERRATA v3.5b：评测 / 考核 / 使用三层全部对齐物种共存
+
+v3.5 上线后用户反馈"看上去还是不行"。复盘日志：演化层（HGT 同类相吸 + 物种面板 + `colony_dual_acc`）一切正常——AND 专家 93%、NOT 专家 85%、`colony_dual_acc` 0.89——**但 Dashboard 头条的 `consensus_acc` 才 33%，6 题考试 0/6**。
+
+诊断很清楚：v3.5 把"L2 是否成功"从单体维度改成了菌落维度，但 **评测 + 推理两层还在用 v3.4 的"问任意一个最强单体"逻辑**。NOT 专家在 AND 题上沉默，被均值算成"不答=不对"，把 AND 命中率拉低到 33%；6 题考试用 `target=best`，挑出来的常常是某个 NOT 专家，对 AND 题一面倒错。**演化对了，量尺没换**。
+
+**修法（v3.5b 三件套）**：
+
+1. **niche-aware consensus**（`Population`）—— 多算一份"专家投票"指标：
+
+   ```python
+   # AND 题只让 AND/dual 专家投票；NOT 题只让 NOT/dual 专家投票
+   consensus_acc_swarm   # 专家投票准确率（取代 consensus_acc 当头条）
+   consensus_voters_swarm # 投票人数；==0 时 UI 显示"尚无 X 专家"，不再算"沉默=错"
+   acc_and_11_swarm / acc_not_0_swarm  # 6 行真值表的 swarm 版本
+   row_acc_swarm / row_n_swarm         # 与原 row buf 同 ring，可独立读
+   ```
+
+2. **niche routing 推理**（`SimulationRuntime._resolve_query_target`）—— 集中 dispatch，新增 4 个 target：
+   - `colony`：根据 `f_s_hz` 自动路由（≤ 50 Hz → AND 专家；> 50 Hz → NOT 专家）
+   - `and_expert` / `not_expert` / `dual_expert`：调 `Population.top_k_slots_by_niche(...)`
+   - **Fallback 契约**：niche 池为空 → 自动回退 `ensemble` + `target_degraded = "no_<niche>_specialist"`；响应里同时返回 `target_resolved`（实际用的）和 `target_degraded`（回退原因 or null）
+
+3. **UI 对齐**（评测 + 使用同时换尺）：
+   - L2v2 Dashboard `Translator`：头条改"专家共识"（swarm bit + acc + 投票数），全员均值 demote 成灰字
+   - L2v2 Dashboard `SpecificAccuracy`：`accAnd11Swarm` / `accNot0Swarm` 当头条；提示语从"沉默搭便车"改成"物种共存的预期表征"
+   - L2v2 Dashboard `TruthTableMatrix`：每格头条 = swarm 命中率（带 niche 投票数），下方灰字 = 全员均值
+   - Use 页 `LogicTester`：默认 target 改 `colony`；新增 chip 选项 `colony / and_expert / not_expert`；OneShotResult 顶上加路由徽章（"→ 问了 AND 专家 · 5 票" 或 "↩ 菌落尚无 NOT 专家，已回退 ensemble"）；6 题成绩单加"问了谁"列
+   - UsePage 底层接口面板：`target` 下拉加全部 v3.5b 选项，hint 文案讲清楚每种用途
+
+**哲学一致性**：`acc_and_pop` / `consensus_acc` 等"全员均值"**保留不删**——它们仍然是诊断"全菌落是否被某物种独占"的有效工具（如果 `acc_and_pop ≈ acc_and_swarm` 说明几乎没有 NOT 专家）。但 UI 默认突出 swarm 指标，因为 v3.5 物种共存模型下，**那才是 L2 是否成功的正确尺子**。
+
+**生物对齐**：niche-aware consensus 等价于"调查一个生态系统的生产力"时，光合作用效率只问植物、固氮效率只问豆科菌，不会去平均"水熊虫的光合 + 大肠杆菌的固氮"。inference routing 等价于"治病不去问全人类，去问对应专科医生"。专科不存在时回退到全科——和现实医院 triage 一致。
+
+**测试**：`tests/test_speciation.py` 新增 6 个 case 覆盖 niche-aware consensus / row swarm / `top_k_slots_by_niche` / `colony` 路由 / 专家空池 fallback。全部 127 个 pytest + tsc 通过。
+
 ---
 
 ## 6. 未来演进方向

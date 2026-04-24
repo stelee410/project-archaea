@@ -53,7 +53,10 @@ const DEFAULTS: LiveTrackForm = {
 const HEAD_HIGHLIGHT = 5;
 
 interface Props {
-  target: "best" | "ensemble" | "random" | "swarm";
+  // SPEC_L2_V3.5b — accepts the full InferenceTarget union (incl. colony /
+  // and_expert / not_expert / dual_expert).  LiveTrackCard itself doesn't
+  // care about the niche routing — it just passes target through to api.sweep.
+  target: import("../types").InferenceTarget;
   topK: number;
   swarmRadius: number;
 }

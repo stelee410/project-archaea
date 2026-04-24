@@ -31,7 +31,9 @@ interface InteractionRow {
 
 interface UseFormState {
   fIn: number;
-  target: "best" | "ensemble" | "random" | "swarm";
+  // SPEC_L2_V3.5b — accepts the full InferenceTarget union; the legacy quartet
+  // is still here for backwards-compatibility of saved persistent state.
+  target: import("../types").InferenceTarget;
   topK: number;
   durationMs: number;
   warmupMs: number;
@@ -262,24 +264,40 @@ export function UsePage({ colony }: UsePageProps) {
                 className="num-input"
               />
             </Field>
-            <Field label="查询目标 target" hint="best=fitness 最高；ensemble=top-K 平均；swarm=黏菌 hotspot 集体投票">
+            <Field
+              label="查询目标 target"
+              hint="colony=按题选专家 (v3.5 推荐)；and/not_expert=只问对应专家；ensemble=top-K 平均；swarm=黏菌 hotspot 集体投票"
+            >
               <select
                 value={target}
                 onChange={(e) => setField("target", e.target.value as typeof target)}
                 className="num-input"
               >
-                <option value="best">best (默认)</option>
-                <option value="ensemble">ensemble (top-K)</option>
+                <option value="colony">🧬 colony (按题选专家, v3.5 推荐)</option>
+                <option value="and_expert">AND 专家</option>
+                <option value="not_expert">NOT 专家</option>
+                <option value="dual_expert">Dual 专家</option>
+                <option value="ensemble">ensemble (top-K, 全员)</option>
+                <option value="best">best (单点)</option>
                 <option value="random">random</option>
                 <option value="swarm">🍄 swarm (黏菌 hotspot)</option>
               </select>
             </Field>
-            <Field label="Top-K (仅 ensemble)" hint="ensemble 模式下取多少个 agent 平均">
+            <Field
+              label="Top-K"
+              hint="对 colony / and_expert / not_expert / ensemble 都生效——参与投票的人数上限"
+            >
               <input
                 type="number"
                 min={1}
                 max={50}
-                disabled={target !== "ensemble"}
+                disabled={
+                  target !== "ensemble"
+                    && target !== "colony"
+                    && target !== "and_expert"
+                    && target !== "not_expert"
+                    && target !== "dual_expert"
+                }
                 value={topK}
                 onChange={(e) => setField("topK", Number(e.target.value))}
                 className="num-input"

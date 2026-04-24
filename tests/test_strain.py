@@ -238,69 +238,153 @@ def test_strain_carries_task_for_runtime_check(tmp_path: Path) -> None:
     assert meta.task == TASK_L1
 
 
-# ── 4. Admixture window boosts HGT count ───────────────────────────────
+# ── 4. SPEC_L2_V3.4 — 3-phase admixture protocol ───────────────────────
 
 
-def test_admixture_window_boosts_hgt() -> None:
-    """In the admixture window, eff_hgt_prob = base × multiplier (capped at 1)."""
-    rng = np.random.default_rng(123)
+def _make_admixture_pop(
+    *,
+    commensal_s: float,
+    exchange_s: float,
+    phase2_blend: float = 0.05,
+    phase2_prob_mul: float = 1.0,
+    base_hgt_prob: float = 0.05,
+    base_hgt_blend: float = 0.30,
+    pop_max: int = 80,
+    seed: int = 123,
+) -> Population:
+    rng = np.random.default_rng(seed)
     slime = SlimeConfig(
         enabled=True,
         grid_size=8,
         hgt_enabled=True,
-        hgt_prob=0.05,
-        hgt_blend=0.3,
+        hgt_prob=base_hgt_prob,
+        hgt_blend=base_hgt_blend,
         hgt_radius=3,
-        hgt_cost=0.0,        # avoid starving recipients during the test
-        hgt_donor_ratio=1.0, # SlimeConfig minimum; any donor with ≥ recipient credit counts
+        hgt_cost=0.0,
+        hgt_donor_ratio=1.0,
+        pheromone_bonus_k=0.0,
+        migrate_enabled=False,
+    )
+    return Population(
+        pop_max=pop_max,
+        rng=rng,
+        n_initial=pop_max,
+        task=TASK_L2V2,
+        slime=slime,
+        admixture_commensal_s=commensal_s,
+        admixture_exchange_s=exchange_s,
+        admixture_phase2_blend=phase2_blend,
+        admixture_phase2_prob_mul=phase2_prob_mul,
+    )
+
+
+def test_admixture_commensal_phase_disables_hgt() -> None:
+    """Phase 1 must completely suppress HGT — no transfers, no eff_hgt_prob."""
+    pop = _make_admixture_pop(commensal_s=5.0, exchange_s=5.0)
+    counts = []
+    for _ in range(10):  # 5.0 s = strictly inside commensal phase
+        info = pop.step_window()
+        assert info["admixture_phase"] == 1, info["admixture_phase"]
+        assert info["admixture_active"] is True
+        assert info["eff_hgt_prob"] == 0.0
+        assert info["eff_hgt_blend"] == 0.0
+        counts.append(int(info["hgt_count"]))
+    assert sum(counts) == 0, (
+        f"commensal phase 1 must disable HGT entirely, got {sum(counts)} transfers"
+    )
+
+
+def test_admixture_exchange_phase_uses_low_blend() -> None:
+    """Phase 2 reports the configured low blend, not the slime baseline."""
+    pop = _make_admixture_pop(
+        commensal_s=2.0, exchange_s=4.0, phase2_blend=0.07, phase2_prob_mul=2.0,
+        base_hgt_blend=0.30, base_hgt_prob=0.05,
+    )
+    # Skip past phase 1.
+    for _ in range(4):  # 2.0 s
+        pop.step_window()
+    info = pop.step_window()
+    assert info["admixture_phase"] == 2
+    assert info["admixture_active"] is True
+    assert info["eff_hgt_blend"] == pytest.approx(0.07)
+    assert info["eff_hgt_prob"] == pytest.approx(0.05 * 2.0)
+
+
+def test_admixture_restored_phase_returns_to_baseline() -> None:
+    """Phase 3 (after exchange ends) restores baseline blend / prob."""
+    pop = _make_admixture_pop(
+        commensal_s=1.0, exchange_s=1.0, phase2_blend=0.05, phase2_prob_mul=4.0,
+        base_hgt_blend=0.30, base_hgt_prob=0.05,
+    )
+    # Run all the way past commensal_s + exchange_s = 2.0 s.
+    for _ in range(8):  # 4.0 s
+        pop.step_window()
+    info = pop.step_window()
+    assert info["admixture_phase"] == 3
+    assert info["admixture_active"] is False
+    assert info["eff_hgt_blend"] == pytest.approx(0.30)
+    assert info["eff_hgt_prob"] == pytest.approx(0.05)
+
+
+def test_admixture_disabled_protocol_runs_baseline_from_t0() -> None:
+    """commensal_s=0 and exchange_s=0 must mean phase=3 from the very first window."""
+    pop = _make_admixture_pop(
+        commensal_s=0.0, exchange_s=0.0, base_hgt_blend=0.30, base_hgt_prob=0.05,
+    )
+    info = pop.step_window()
+    assert info["admixture_phase"] == 3
+    assert info["admixture_active"] is False
+    assert info["eff_hgt_blend"] == pytest.approx(0.30)
+    assert info["eff_hgt_prob"] == pytest.approx(0.05)
+
+
+def test_admixture_phase_transitions_are_monotonic() -> None:
+    """Walk through 1 → 2 → 3 across the boundaries; never goes backwards."""
+    pop = _make_admixture_pop(commensal_s=1.0, exchange_s=2.0)
+    seen: list[int] = []
+    for _ in range(10):  # 5.0 s — covers all three phases
+        info = pop.step_window()
+        seen.append(int(info["admixture_phase"]))
+    # Must contain at least one of each phase, in non-decreasing order.
+    assert 1 in seen and 2 in seen and 3 in seen, seen
+    assert seen == sorted(seen), f"phase regressed: {seen}"
+
+
+def test_admixture_exchange_blend_is_applied_to_recipients() -> None:
+    """During phase 2, blend_weights uses phase2_blend (not slime.hgt_blend).
+
+    We verify by setting phase2_blend=0 (no change) and confirming recipient
+    weights remain identical to themselves after a window where HGT events
+    fire — proves the eff_blend is wired into the actual blend_weights call.
+    """
+    rng = np.random.default_rng(0)
+    slime = SlimeConfig(
+        enabled=True,
+        grid_size=8,
+        hgt_enabled=True,
+        hgt_prob=1.0,           # force HGT every neighbor pair
+        hgt_blend=0.30,         # baseline that we must NOT see during phase 2
+        hgt_radius=8,
+        hgt_cost=0.0,
+        hgt_donor_ratio=1.0,
         pheromone_bonus_k=0.0,
         migrate_enabled=False,
     )
     pop = Population(
-        pop_max=80,
-        rng=rng,
-        n_initial=80,
-        task=TASK_L2V2,
-        slime=slime,
-        admixture_window_s=10.0,    # first 10 sim-seconds = boosted HGT
-        admixture_hgt_multiplier=10.0,
-    )
-    # Run 5 windows inside the window, then 5 outside it (each window = 0.5 s).
-    inside_counts = []
-    for _ in range(20):  # 10 seconds
-        info = pop.step_window()
-        inside_counts.append(int(info["hgt_count"]))
-        # admixture_active should be True for all windows where the *previous*
-        # tick still had t < window; the flag flips at the boundary.
-    # Window has ended now (t_sim = 10.0).
-    assert pop._t_sim_seconds == pytest.approx(10.0)
-    outside_counts = []
-    for _ in range(20):  # next 10 seconds
-        info = pop.step_window()
-        outside_counts.append(int(info["hgt_count"]))
-        assert info["admixture_active"] is False
-    inside_total = sum(inside_counts)
-    outside_total = sum(outside_counts)
-    # We don't assert exact ratios — Poisson noise + drift in pop credit makes
-    # it noisy — but the boosted regime must produce strictly more HGT events
-    # than the unboosted, otherwise the multiplier is silently broken.
-    assert inside_total > outside_total, (
-        f"admixture window failed to boost HGT: "
-        f"inside={inside_total}, outside={outside_total}"
-    )
-
-
-def test_admixture_window_zero_means_no_boost() -> None:
-    """admixture_window_s=0 → eff_hgt_prob == base every window."""
-    pop = Population(
         pop_max=20,
-        rng=np.random.default_rng(0),
+        rng=rng,
         n_initial=20,
         task=TASK_L2V2,
-        slime=SlimeConfig(enabled=True, hgt_prob=0.05, pheromone_bonus_k=0.0),
-        admixture_window_s=0.0,
-        admixture_hgt_multiplier=10.0,
+        slime=slime,
+        admixture_commensal_s=0.0,    # skip phase 1
+        admixture_exchange_s=10.0,    # stay in phase 2
+        admixture_phase2_blend=0.0,   # no blending should occur
+        admixture_phase2_prob_mul=1.0,
     )
+    snap = pop.weights[pop.alive].copy()
     info = pop.step_window()
-    assert info["admixture_active"] is False
-    assert info["eff_hgt_prob"] == pytest.approx(0.05)
+    assert info["admixture_phase"] == 2
+    # Even with hgt_count > 0, weights cannot have changed when blend == 0.
+    assert np.allclose(pop.weights[pop.alive], snap), (
+        "phase2_blend=0 must leave recipient weights untouched"
+    )

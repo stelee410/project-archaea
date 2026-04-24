@@ -3,7 +3,7 @@ import clsx from "clsx";
 import { api } from "../../api";
 import { useStore } from "../../store";
 import { usePersistentState } from "../../hooks/usePersistentState";
-import type { InferenceResponse } from "../../types";
+import type { InferenceResponse, InferenceTarget } from "../../types";
 
 /**
  * SPEC_L2_V2.0 — human-friendly "ask the swarm a logic question" panel.
@@ -51,6 +51,10 @@ interface QuestionResult extends QuestionSpec {
   fB: number;
   fS: number;
   durationMs: number;
+  // SPEC_L2_V3.5b — who actually answered (after niche routing / fallback)
+  targetResolved?: string;
+  targetDegraded?: string | null;
+  agentCount?: number;
 }
 
 function expectedBit(mode: Mode, a: Bit, b: Bit): Bit {
@@ -86,7 +90,13 @@ function ALL_QUESTIONS(): QuestionSpec[] {
 // Self-contained query parameters — LogicTester is the *only* place L2v2
 // users tweak target / topK etc., so it owns its own persistent form (no
 // props, no shared "use-form" key with the L1 legacy panel).
-type QueryTarget = "best" | "ensemble" | "random" | "swarm";
+//
+// SPEC_L2_V3.5b — niche-aware targets join the legacy quartet:
+//   colony      : 按当前题目自动路由（AND 题问 AND 专家，NOT 题问 NOT 专家）
+//   and_expert  : 强制问 AND 专家
+//   not_expert  : 强制问 NOT 专家
+//   ensemble/best/random/swarm : 旧的 v2.x 行为，作为对照
+type QueryTarget = InferenceTarget;
 
 interface QueryFormState {
   target: QueryTarget;
@@ -97,7 +107,9 @@ interface QueryFormState {
 }
 
 const QUERY_FORM_DEFAULTS: QueryFormState = {
-  target: "ensemble",   // L2v2 推荐 ensemble 而非 best — 单个 best 常陷"塌陷个体"
+  // SPEC_L2_V3.5b 默认 = colony：按题目自动选专家。在物种共存模型下，
+  // 这是唯一一个能正确反映「菌落集体智能」的 target。
+  target: "colony",
   topK: 10,
   swarmRadius: 1,
   durationMs: 500,      // SPEC §2 评估窗口
@@ -156,6 +168,9 @@ export function LogicTester() {
       fB,
       fS,
       durationMs,
+      targetResolved: r.target_resolved,
+      targetDegraded: r.target_degraded ?? null,
+      agentCount: r.agents?.length ?? 0,
     };
   }
 
@@ -293,7 +308,11 @@ export function LogicTester() {
         </button>
         <span className="text-[11px] text-amber-200/50 self-center">
           目标 agent: <code className="px-1 bg-slate-950 rounded">{target}</code>
-          {target === "ensemble" && ` (top-${topK})`}
+          {(target === "ensemble"
+            || target === "colony"
+            || target === "and_expert"
+            || target === "not_expert"
+            || target === "dual_expert") && ` (top-${topK})`}
           {target === "swarm" && ` (黏菌 ±${swarmRadius})`}
           · duration={durationMs}ms
         </span>
@@ -335,8 +354,13 @@ function QuerySettings({
   const swarmDisabled = !slimeOn;
 
   const targetOptions: { value: QueryTarget; label: string; disabled?: boolean }[] = [
+    // SPEC_L2_V3.5b — niche-aware (recommended after speciation)
+    { value: "colony", label: "🧬 colony · 按题选专家（推荐）" },
+    { value: "and_expert", label: "AND 专家 · 只问 AND 群" },
+    { value: "not_expert", label: "NOT 专家 · 只问 NOT 群" },
+    // Legacy (kept for diagnostic / comparison)
+    { value: "ensemble", label: "ensemble · top-K 平均（全员）" },
     { value: "best", label: "best · fitness 最高" },
-    { value: "ensemble", label: "ensemble · top-K 平均" },
     { value: "random", label: "random · 随机活体" },
     { value: "swarm", label: `🍄 swarm${swarmDisabled ? "（需开黏菌）" : ""}`, disabled: swarmDisabled },
   ];
@@ -371,10 +395,16 @@ function QuerySettings({
           ))}
         </div>
         <div className="text-[10px] text-slate-500 mt-1.5 leading-snug min-h-[2.4em]">
+          {target === "colony" &&
+            "v3.5 物种共存模型默认。AND 题自动问 AND 专家，NOT 题问 NOT 专家——这才是菌落集体智能的正确用法。"}
+          {target === "and_expert" &&
+            `强制只问 AND/dual 专家（按 acc_AND 排序前 ${topK}）。NOT 题会被 AND 专家答错——用于诊断 AND 专业化是否成功。`}
+          {target === "not_expert" &&
+            `强制只问 NOT/dual 专家（按 acc_NOT 排序前 ${topK}）。AND 题会答错——用于诊断 NOT 专业化是否成功。`}
           {target === "best" &&
-            "只问 fitness 最高那一个。v2.3 加权后，silent 假精英会被天花板暴露，best 比 v2.2 时代靠谱很多。"}
+            "只问 fitness 最高那一个。v3.5 后 fitness 是 mean(acc_AND, acc_NOT)，物种化群里 best 通常是稀有 dual_expert（或者专精偏向某 mode 的个体）。"}
           {target === "ensemble" &&
-            `问 fitness 前 ${topK} 个 agent，输出取平均。最稳的"看群体真实水平"方式，对单点塌陷有抵抗力。`}
+            `问 fitness 前 ${topK} 个 agent（不分 niche），输出取平均。在物种化群里会被另一物种沉默稀释——v3.5 之前的默认。`}
           {target === "random" && "随机活体——抽样看普通成员什么水平（多半还在学习）。"}
           {target === "swarm" &&
             (swarmDisabled
@@ -385,13 +415,21 @@ function QuerySettings({
 
       {/* Row 2: per-target params — show only the relevant one */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mb-2">
-        {target === "ensemble" && (
+        {(target === "ensemble"
+          || target === "colony"
+          || target === "and_expert"
+          || target === "not_expert"
+          || target === "dual_expert") && (
           <ChipRow
             label="Top-K（合议人数）"
             presets={topKPresets}
             value={topK}
             onPick={(v) => setField("topK", v)}
-            hint="参与平均的 fitness 排名前 K 个 agent。K 越大越稳但越被平庸稀释。"
+            hint={
+              target === "colony" || target === "and_expert" || target === "not_expert" || target === "dual_expert"
+                ? "参与投票的对应 niche 专家数量。专家少时实际数量可能小于 K（系统会自动用现有的全部）。"
+                : "参与平均的 fitness 排名前 K 个 agent。K 越大越稳但越被平庸稀释。"
+            }
           />
         )}
         {target === "swarm" && !swarmDisabled && (
@@ -589,6 +627,11 @@ function OneShotResult({ r }: { r: QuestionResult }) {
           {r.correct ? "✓ 正确" : "✗ 错误"}
         </div>
       </div>
+      <RoutingBadge
+        targetResolved={r.targetResolved}
+        targetDegraded={r.targetDegraded}
+        agentCount={r.agentCount}
+      />
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm font-mono">
         <Cell label="种群输出 f_out" value={`${r.fOutHz.toFixed(1)} Hz`} accent="emerald" />
         <Cell
@@ -653,6 +696,10 @@ function BatteryResult({ results }: { results: QuestionResult[] }) {
   const total = results.length;
   const pct = total > 0 ? passed / total : 0;
   const elite = pct >= 5 / 6; // SPEC §5.3 elite threshold = pass both modes
+  // SPEC_L2_V3.5b — surface niche routing per row in the gradebook so users
+  // can SEE that AND题问了AND专家、NOT题问了NOT专家。Without this every
+  // failed row looks the same, hiding the species coexistence success.
+  const anyRouted = results.some((r) => r.targetResolved && r.targetResolved !== "ensemble" && r.targetResolved !== "best");
   return (
     <div className="rounded-md border border-violet-500/40 bg-violet-950/20 p-4">
       <div className="flex items-baseline justify-between mb-3">
@@ -683,6 +730,7 @@ function BatteryResult({ results }: { results: QuestionResult[] }) {
             <th className="text-center px-2 py-1">输出</th>
             <th className="text-center px-2 py-1">期望</th>
             <th className="text-center px-2 py-1">判定</th>
+            {anyRouted && <th className="text-left px-2 py-1">问了谁</th>}
           </tr>
         </thead>
         <tbody>
@@ -714,18 +762,99 @@ function BatteryResult({ results }: { results: QuestionResult[] }) {
                   <span className="text-rose-300">✗</span>
                 )}
               </td>
+              {anyRouted && (
+                <td className="px-2 py-1.5 text-[10px]">
+                  <RoutedAt r={r} />
+                </td>
+              )}
             </tr>
           ))}
         </tbody>
       </table>
       <p className="text-[11px] text-violet-200/60 mt-3 leading-relaxed">
         {elite
-          ? "⭐ 该 agent / 子群已通过全部 6 题。SPEC §5.3 验收要求 5% 个体能同时通过 AND 与 NOT — 你刚刚找到了一个。"
+          ? "⭐ 全部 6 题通过。在 v3.5 物种共存模型下，这意味着菌落里 AND 专家 + NOT 专家都能各司其职——是『集体智能』达成的硬证据，不再要求单个体双修。"
           : pct >= 4 / 6
-            ? "已掌握大部分逻辑，仍有少数边角题未通过。可以多跑几次种群（让演化继续），或换 target 试更精英的子群。"
+            ? "已掌握大部分逻辑，仍有少数边角题未通过。检查右栏「问了谁」——若某行被回退到 ensemble，说明对应专家尚未演化出来。"
             : "种群还在学习阶段。先回设置页跑长一点（>10 分钟）让 fitness 收敛，再回来测试。"}
       </p>
     </div>
+  );
+}
+
+// SPEC_L2_V3.5b — small badge surfacing niche routing for one question.
+// Lives directly under the verdict so users can see WHO answered (and
+// whether the runtime had to fall back).
+function RoutingBadge({
+  targetResolved,
+  targetDegraded,
+  agentCount,
+}: {
+  targetResolved?: string;
+  targetDegraded?: string | null;
+  agentCount?: number;
+}) {
+  if (!targetResolved) return null;
+  const labelMap: Record<string, string> = {
+    and_expert: "AND 专家",
+    not_expert: "NOT 专家",
+    dual_expert: "Dual 专家",
+    ensemble: "ensemble (全员)",
+    best: "best (单点)",
+    random: "random",
+    swarm: "swarm",
+  };
+  const label = labelMap[targetResolved] ?? targetResolved;
+  const isFallback = !!targetDegraded;
+  return (
+    <div className="mb-3 flex items-center gap-2 text-[11px]">
+      <span
+        className={clsx(
+          "px-2 py-0.5 rounded font-mono font-semibold",
+          isFallback
+            ? "bg-amber-900/40 text-amber-200 border border-amber-700/50"
+            : "bg-cyan-900/40 text-cyan-200 border border-cyan-700/50"
+        )}
+      >
+        {isFallback ? "↩" : "→"} 问了 {label}
+        {agentCount !== undefined && agentCount > 0 && (
+          <span className="text-cyan-200/60 ml-1">· {agentCount} 票</span>
+        )}
+      </span>
+      {isFallback && (
+        <span className="text-amber-300/80 italic">
+          {targetDegraded === "no_and_expert_specialist" && "菌落尚无 AND 专家，已回退 ensemble"}
+          {targetDegraded === "no_not_expert_specialist" && "菌落尚无 NOT 专家，已回退 ensemble"}
+          {targetDegraded === "no_dual_expert_specialist" && "菌落尚无 dual 专家，已回退 ensemble"}
+          {targetDegraded === "no_f_s_for_routing" && "缺 f_s，无法路由"}
+        </span>
+      )}
+    </div>
+  );
+}
+
+function RoutedAt({ r }: { r: QuestionResult }) {
+  const labelMap: Record<string, string> = {
+    and_expert: "AND",
+    not_expert: "NOT",
+    dual_expert: "Dual",
+    ensemble: "全员",
+    best: "best",
+    random: "rand",
+    swarm: "swarm",
+  };
+  const label = labelMap[r.targetResolved ?? ""] ?? r.targetResolved ?? "—";
+  return (
+    <span
+      className={clsx(
+        "px-1.5 py-0.5 rounded font-mono",
+        r.targetDegraded
+          ? "bg-amber-900/40 text-amber-200"
+          : "bg-cyan-900/40 text-cyan-200"
+      )}
+    >
+      {label}{r.targetDegraded ? "↩" : ""}{r.agentCount ? ` ·${r.agentCount}` : ""}
+    </span>
   );
 }
 

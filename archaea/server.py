@@ -68,10 +68,21 @@ class SimConfigBody(BaseModel):
     task_difficulty: Literal[
         "uniform", "balanced", "hard", "extreme", "and_only", "not_only"
     ] = "balanced"
-    # SPEC_L2_V3.0 — admixture experiment (杂交皿).
+    # SPEC_L2_V3.0 / SPEC_L2_V3.4 — admixture experiment (杂交皿).
     founders: list["FounderEntry"] | None = None
-    admixture_window_s: float = Field(0.0, ge=0.0, le=600.0)
-    admixture_hgt_multiplier: float = Field(5.0, ge=1.0, le=50.0)
+    # 3-phase ecological admixture protocol (replaces v3.0 single window):
+    #   Phase 1 — commensal (HGT off):    0 .. admixture_commensal_s
+    #   Phase 2 — controlled exchange:    commensal_s .. commensal_s + exchange_s
+    #   Phase 3 — restored (baseline HGT):afterwards
+    # Defaults of 0/0 disable the protocol entirely.
+    admixture_commensal_s: float = Field(0.0, ge=0.0, le=600.0)
+    admixture_exchange_s: float = Field(0.0, ge=0.0, le=1200.0)
+    admixture_phase2_blend: float = Field(0.05, ge=0.0, le=1.0)
+    admixture_phase2_prob_mul: float = Field(1.0, ge=0.0, le=50.0)
+    # SPEC_L2_V3.5 — assortative HGT (prezygotic isolation by niche similarity).
+    # null → legacy / disabled (richest neighbour wins, bit-identical to v3.4);
+    # 0.0 → strict speciation (only closest-niche donor); larger values relax.
+    assortative_temperature: float | None = Field(None, ge=0.0, le=10.0)
 
 
 class FounderEntry(BaseModel):
@@ -92,7 +103,21 @@ SimConfigBody.model_rebuild()
 
 class InferenceBody(BaseModel):
     f_in_hz: float = Field(50.0, ge=0.0, le=1000.0)
-    target: Literal["best", "ensemble", "random", "swarm"] = "best"
+    # SPEC_L2_V3.5b — niche-aware targets join the legacy quartet:
+    #   colony      : route by f_s_hz (AND→and_expert, NOT→not_expert)
+    #   and_expert  : top-K AND-or-DUAL specialists, ranked by acc_AND
+    #   not_expert  : top-K NOT-or-DUAL specialists, ranked by acc_NOT
+    #   dual_expert : DUAL specialists only (rare; mostly diagnostic)
+    target: Literal[
+        "best",
+        "ensemble",
+        "random",
+        "swarm",
+        "colony",
+        "and_expert",
+        "not_expert",
+        "dual_expert",
+    ] = "best"
     top_k: int = Field(5, ge=1, le=50)
     duration_ms: float = Field(500.0, ge=10.0, le=5000.0)
     warmup_ms: float = Field(100.0, ge=0.0, le=2000.0)
@@ -107,7 +132,18 @@ class SweepBody(BaseModel):
     f_in_min: float = Field(0.0, ge=0.0, le=1000.0)
     f_in_max: float = Field(200.0, ge=0.0, le=1000.0)
     n_points: int = Field(15, ge=2, le=64)
-    target: Literal["best", "ensemble", "random", "swarm"] = "best"
+    # SPEC_L2_V3.5b — same expanded set as InferenceBody.  sweep does not
+    # carry an f_s, so 'colony'/'auto' degrades to 'ensemble' internally.
+    target: Literal[
+        "best",
+        "ensemble",
+        "random",
+        "swarm",
+        "colony",
+        "and_expert",
+        "not_expert",
+        "dual_expert",
+    ] = "best"
     top_k: int = Field(5, ge=1, le=50)
     duration_ms: float = Field(500.0, ge=10.0, le=5000.0)
     warmup_ms: float = Field(100.0, ge=0.0, le=2000.0)
@@ -194,8 +230,11 @@ async def api_start(body: SimConfigBody) -> dict[str, Any]:
             if body.founders
             else None
         ),
-        admixture_window_s=body.admixture_window_s,
-        admixture_hgt_multiplier=body.admixture_hgt_multiplier,
+        admixture_commensal_s=body.admixture_commensal_s,
+        admixture_exchange_s=body.admixture_exchange_s,
+        admixture_phase2_blend=body.admixture_phase2_blend,
+        admixture_phase2_prob_mul=body.admixture_phase2_prob_mul,
+        assortative_temperature=body.assortative_temperature,
     )
     try:
         return get_runtime().start(cfg)

@@ -50,8 +50,23 @@ export function MixerPage() {
   const [synapseGain, setSynapseGain] = useState(2.0);
 
   const [picks, setPicks] = useState<FounderSpec[]>([]);
-  const [windowS, setWindowS] = useState(20.0);
-  const [hgtMul, setHgtMul] = useState(8.0);
+  // SPEC_L2_V3.4 — 3-phase ecological admixture protocol defaults.
+  // commensal=60s lets each strain stabilize in the new dish; exchange=120s
+  // gives a long, low-intensity gene-flow window (blend=0.05 ≪ baseline 0.30
+  // so the larger-magnitude strain can't sweep the smaller-magnitude one in
+  // a single transfer).
+  const [commensalS, setCommensalS] = useState(60.0);
+  const [exchangeS, setExchangeS] = useState(120.0);
+  const [phase2Blend, setPhase2Blend] = useState(0.05);
+  const [phase2ProbMul, setPhase2ProbMul] = useState(1.0);
+  // SPEC_L2_V3.5 — assortative HGT (prezygotic isolation by niche similarity).
+  // null  = legacy / disabled (richest neighbour wins, v3.4 bit-identical)
+  // 0     = strict speciation (only the closest-niche donor)
+  // 0.05–1.0 = soft niche preference (smaller = stronger bias)
+  // Default: 0.30 — moderate assortative bias, recommended after the §5.13
+  // ERRATA documented that single-pool admixture between AND-experts and
+  // D1-seeded NOT-experts collapses both lineages without it.
+  const [assortativeT, setAssortativeT] = useState<number | null>(0.30);
 
   const [busy, setBusy] = useState(false);
   const [launchErr, setLaunchErr] = useState<string | null>(null);
@@ -159,8 +174,11 @@ export function MixerPage() {
         task,
         task_difficulty: difficulty,
         founders: picks,
-        admixture_window_s: windowS,
-        admixture_hgt_multiplier: hgtMul,
+        admixture_commensal_s: commensalS,
+        admixture_exchange_s: exchangeS,
+        admixture_phase2_blend: phase2Blend,
+        admixture_phase2_prob_mul: phase2ProbMul,
+        assortative_temperature: assortativeT,
       };
       const next = await api.start(cfg);
       setStatus(next);
@@ -382,36 +400,185 @@ export function MixerPage() {
         </div>
       </section>
 
-      {/* Admixture window */}
+      {/* Admixture protocol — SPEC_L2_V3.4 */}
       <section className="rounded-lg border border-fuchsia-700/40 bg-fuchsia-950/15 p-4">
         <h2 className="text-base font-semibold text-fuchsia-100 mb-2">
-          💞 杂交期 (admixture window)
+          💞 杂交协议 (SPEC_L2_V3.4 · 3 相)
         </h2>
         <p className="text-xs text-fuchsia-200/80 leading-relaxed mb-3">
-          启动后前 <b>{windowS.toFixed(0)} 秒</b>仿真时间内，HGT 概率 ×{" "}
-          <b>{hgtMul.toFixed(1)}</b>，鼓励两群菌株在新培养皿里大幅交换基因；
-          窗口结束后自动恢复基线。仿真会自动启用 slime grid + HGT、
+          按生物学的「双菌共栖 → 受控基因流 → 自由融合」分三段。
+          v3.0 的「立即放大 HGT」会让权重幅值大的一方瞬间扫荡培养皿（已经
+          实测到 AND 学家被 NOT D1 种子覆盖）；v3.4 用<b>慢热协议</b>替代——
+          先各自适应，再小步渗透，最后才回到基线。仿真自动启用 slime grid + HGT、
           但<b>关闭信息素奖励</b>（避免破坏 oracle 真值表）。
         </p>
-        <div className="grid grid-cols-2 gap-3">
-          <NumField
-            label="窗口长度 (s)"
-            value={windowS}
-            onChange={setWindowS}
-            step={1}
-            min={0}
-          />
-          <NumField
-            label="HGT 倍率 ×"
-            value={hgtMul}
-            onChange={setHgtMul}
-            step={0.5}
-            min={1}
-          />
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mb-3">
+          <div className="rounded border border-cyan-700/50 bg-cyan-950/20 p-3">
+            <div className="text-xs font-semibold text-cyan-100 mb-1">
+              ① 共栖期 (commensal)
+            </div>
+            <div className="text-[11px] text-cyan-200/70 leading-snug mb-2">
+              0 .. {commensalS.toFixed(0)}s · HGT <b>完全关闭</b>。
+              两群菌株共享同一培养皿、独立繁殖、独立竞争——
+              先确认各自能在新环境里活下来。
+            </div>
+            <NumField
+              label="共栖期长度 (s)"
+              value={commensalS}
+              onChange={setCommensalS}
+              step={5}
+              min={0}
+            />
+          </div>
+
+          <div className="rounded border border-fuchsia-700/50 bg-fuchsia-950/20 p-3">
+            <div className="text-xs font-semibold text-fuchsia-100 mb-1">
+              ② 受控交换期 (controlled exchange)
+            </div>
+            <div className="text-[11px] text-fuchsia-200/70 leading-snug mb-2">
+              {commensalS.toFixed(0)} .. {(commensalS + exchangeS).toFixed(0)}s ·
+              HGT 启用，但 blend 仅 <b>{phase2Blend.toFixed(2)}</b>
+              （基线 0.30）。每次只小幅渗透几条权重，
+              避免大幅值一方一口吞掉另一方。
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              <NumField
+                label="交换期长度 (s)"
+                value={exchangeS}
+                onChange={setExchangeS}
+                step={5}
+                min={0}
+              />
+              <NumField
+                label="phase2 blend (η)"
+                value={phase2Blend}
+                onChange={setPhase2Blend}
+                step={0.01}
+                min={0}
+              />
+              <NumField
+                label="phase2 prob ×"
+                value={phase2ProbMul}
+                onChange={setPhase2ProbMul}
+                step={0.5}
+                min={0}
+              />
+            </div>
+          </div>
         </div>
+
+        <div className="rounded border border-slate-700/60 bg-slate-900/40 p-2.5">
+          <div className="text-xs font-semibold text-slate-200 mb-0.5">
+            ③ 恢复期 (restored, t ≥ {(commensalS + exchangeS).toFixed(0)}s)
+          </div>
+          <div className="text-[11px] text-slate-400 leading-snug">
+            协议结束，HGT blend / prob 恢复 colony 基线（0.30 / 0.02）。
+            从这里开始就是普通的 colony 演化了。
+          </div>
+        </div>
+
         <div className="text-[11px] text-fuchsia-200/60 mt-2">
-          eff_hgt_prob 在窗口里 = base_hgt_prob × multiplier （上限 1.0）。
-          想直接让两群「混匀」可以加大窗口；想观察「短促相遇 + 长期独立」就缩短。
+          想跳过协议直接走基线，把两个长度都设为 0；想做「永远低 blend」实验
+          可以把交换期开很大（如 3600s）。
+        </div>
+      </section>
+
+      {/* Speciation / assortative HGT — SPEC_L2_V3.5 */}
+      <section className="rounded-lg border border-emerald-700/40 bg-emerald-950/15 p-4">
+        <h2 className="text-base font-semibold text-emerald-100 mb-2">
+          🧬 物种隔离 · 同类相吸 HGT (SPEC_L2_V3.5)
+        </h2>
+        <p className="text-xs text-emerald-200/80 leading-relaxed mb-3">
+          v3.4 仍然失败是因为 AND 学家和 NOT D1 学家的「基因组不相容」——
+          权重幅值 / 编码方式根本不一样，强行 blend 会两败俱伤。v3.5 接受
+          <b>「群体即生命」</b>原则：不再追求单体「双修」，而是让两个物种<b>
+          共存于同一菌落</b>，AND 个体只跟 AND 换基因、NOT 只跟 NOT 换基因；
+          L2 任务由<b>菌落整体</b>（专家投票）完成，而不是任何单细胞。
+        </p>
+
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-2 mb-3">
+          <button
+            type="button"
+            onClick={() => setAssortativeT(null)}
+            className={clsx(
+              "rounded border p-2 text-left text-xs leading-snug",
+              assortativeT === null
+                ? "border-slate-400/70 bg-slate-700/30 text-slate-100 ring-1 ring-slate-300/60"
+                : "border-slate-700 bg-slate-950/30 text-slate-300 hover:bg-slate-900"
+            )}
+          >
+            <div className="font-semibold mb-0.5">关闭 (legacy)</div>
+            <div className="text-[10px] opacity-80">
+              v3.4 行为：HGT 永远挑「最富裕」的邻居。
+              已知会让 D1 学家单边扫荡 AND 学家。
+            </div>
+          </button>
+          <button
+            type="button"
+            onClick={() => setAssortativeT(0.30)}
+            className={clsx(
+              "rounded border p-2 text-left text-xs leading-snug",
+              assortativeT !== null && assortativeT > 0
+                ? "border-emerald-400/70 bg-emerald-700/20 text-emerald-100 ring-1 ring-emerald-300/60"
+                : "border-slate-700 bg-slate-950/30 text-slate-300 hover:bg-slate-900"
+            )}
+          >
+            <div className="font-semibold mb-0.5">柔性偏好 (推荐)</div>
+            <div className="text-[10px] opacity-80">
+              T &gt; 0：donor 抽样 ∝ exp(-|Δniche|/T)。
+              小 T = 强偏好，大 T = 弱偏好。仍允许偶发跨界基因。
+            </div>
+          </button>
+          <button
+            type="button"
+            onClick={() => setAssortativeT(0)}
+            className={clsx(
+              "rounded border p-2 text-left text-xs leading-snug",
+              assortativeT === 0
+                ? "border-fuchsia-400/70 bg-fuchsia-700/20 text-fuchsia-100 ring-1 ring-fuchsia-300/60"
+                : "border-slate-700 bg-slate-950/30 text-slate-300 hover:bg-slate-900"
+            )}
+          >
+            <div className="font-semibold mb-0.5">严格物种隔离</div>
+            <div className="text-[10px] opacity-80">
+              T = 0：只有 niche 最近的同类才能转入基因。
+              彻底封死跨物种 HGT，保护各自专长。
+            </div>
+          </button>
+        </div>
+
+        {assortativeT !== null && (
+          <div className="rounded border border-emerald-700/40 bg-emerald-950/20 p-3">
+            <label className="block text-xs text-emerald-200 mb-1">
+              assortative_temperature (T) ={" "}
+              <span className="font-mono numeric">{assortativeT.toFixed(2)}</span>
+              <span className="text-emerald-300/60 ml-2">
+                niche = acc_AND − acc_NOT ∈ [-1, +1]
+              </span>
+            </label>
+            <input
+              type="range"
+              min={0}
+              max={2}
+              step={0.05}
+              value={assortativeT}
+              onChange={(e) => setAssortativeT(Number(e.target.value))}
+              className="w-full accent-emerald-400"
+            />
+            <div className="flex justify-between text-[10px] text-emerald-200/60 font-mono mt-0.5">
+              <span>0 = 严格隔离</span>
+              <span>0.3 = 推荐</span>
+              <span>1 = 弱偏好</span>
+              <span>2 = 几乎随机</span>
+            </div>
+          </div>
+        )}
+
+        <div className="text-[11px] text-emerald-200/60 mt-2">
+          ObservePage 上会出现「物种结构」面板和 colony_dual_acc 指标——
+          后者只有当 AND 专家和 NOT 专家都达到一定数量时才非零，是 v3.5 真正
+          的 L2 成功判据。
         </div>
       </section>
 
@@ -443,7 +610,9 @@ export function MixerPage() {
         </button>
         <span className="text-xs text-slate-400 numeric">
           founders = {picks.length} · sum_frac = {totalFrac.toFixed(2)} ·
-          window = {windowS.toFixed(0)}s × {hgtMul.toFixed(1)}
+          commensal = {commensalS.toFixed(0)}s · exchange ={" "}
+          {exchangeS.toFixed(0)}s · η = {phase2Blend.toFixed(2)} · T_niche ={" "}
+          {assortativeT === null ? "off" : assortativeT.toFixed(2)}
         </span>
       </div>
     </div>

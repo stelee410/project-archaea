@@ -37,6 +37,23 @@ export function L2Dashboard({ ev }: { ev: TelemetryEvent | null }) {
   const rowAcc = ev.row_acc ?? null;
   const rowN = ev.row_n ?? null;
   const difficulty = ev.task_difficulty ?? "balanced";
+  // SPEC_L2_V3.5 — niche / species coexistence telemetry.
+  const speciesCounts = ev.species_counts ?? null;
+  const accAndSwarm = ev.acc_and_swarm ?? 0;
+  const accNotSwarm = ev.acc_not_swarm ?? 0;
+  const colonyDualAcc = ev.colony_dual_acc ?? 0;
+  const assortativeT = ev.assortative_temperature ?? null;
+  // SPEC_L2_V3.5b — niche-aware "评测层" surface.  Headlines now come from
+  // the swarm versions (only on-niche voters); the legacy *_pop numbers
+  // demote to footnotes (they get diluted by the silent off-niche majority
+  // and were the source of the "好像不行" mis-read after speciation).
+  const consAccSwarm = ev.consensus_acc_swarm ?? 0;
+  const consBitSwarm = ev.consensus_bit_swarm ?? null;
+  const consVotersSwarm = ev.consensus_voters_swarm ?? 0;
+  const accAnd11Swarm = ev.acc_and_11_swarm ?? 0;
+  const accNot0Swarm = ev.acc_not_0_swarm ?? 0;
+  const rowAccSwarm = ev.row_acc_swarm ?? null;
+  const rowNSwarm = ev.row_n_swarm ?? null;
 
   return (
     <div className="rounded-lg border border-amber-700/40 bg-amber-950/10 p-4 space-y-4">
@@ -55,6 +72,9 @@ export function L2Dashboard({ ev }: { ev: TelemetryEvent | null }) {
         consensusAcc={consAcc}
         accAnd={accAnd}
         accNot={accNot}
+        consensusAccSwarm={consAccSwarm}
+        consensusBitSwarm={consBitSwarm}
+        consensusVotersSwarm={consVotersSwarm}
       />
 
       <SpecificAccuracy
@@ -63,6 +83,8 @@ export function L2Dashboard({ ev }: { ev: TelemetryEvent | null }) {
         accAnd={accAnd}
         accNot={accNot}
         difficulty={difficulty}
+        accAnd11Swarm={accAnd11Swarm}
+        accNot0Swarm={accNot0Swarm}
       />
 
       <LogicProgress
@@ -72,7 +94,25 @@ export function L2Dashboard({ ev }: { ev: TelemetryEvent | null }) {
         diversity={diversity}
       />
 
-      {rowAcc && rowN && <TruthTableMatrix rowAcc={rowAcc} rowN={rowN} />}
+      {speciesCounts && (
+        <SpeciesPanel
+          counts={speciesCounts}
+          accAndSwarm={accAndSwarm}
+          accNotSwarm={accNotSwarm}
+          colonyDualAcc={colonyDualAcc}
+          assortativeT={assortativeT}
+          totalAlive={ev.pop_size}
+        />
+      )}
+
+      {rowAcc && rowN && (
+        <TruthTableMatrix
+          rowAcc={rowAcc}
+          rowN={rowN}
+          rowAccSwarm={rowAccSwarm}
+          rowNSwarm={rowNSwarm}
+        />
+      )}
 
       <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
         <SurvivalCounter
@@ -101,12 +141,19 @@ function Translator({
   consensusAcc,
   accAnd,
   accNot,
+  consensusAccSwarm,
+  consensusBitSwarm,
+  consensusVotersSwarm,
 }: {
   oracle: OracleSnapshot | null;
   consensus: 0 | 1 | null;
   consensusAcc: number;
   accAnd: number;
   accNot: number;
+  // SPEC_L2_V3.5b — niche-aware ("expert vote") consensus.
+  consensusAccSwarm: number;
+  consensusBitSwarm: 0 | 1 | null;
+  consensusVotersSwarm: number;
 }) {
   if (!oracle) {
     return (
@@ -147,27 +194,58 @@ function Translator({
           <span className="text-amber-200/60">预期: </span>
           <span className="text-amber-100 font-bold">{oracle.target_bit}</span>
         </div>
-        <div className="ml-auto">
-          <span className="text-amber-200/60">族群共识: </span>
-          {consensus === null ? (
-            <span className="text-slate-400">—</span>
-          ) : (
-            <span
-              className={clsx(
-                "font-bold text-base",
-                correct ? "text-emerald-300" : "text-rose-300"
-              )}
-            >
-              [{consensus}]
-            </span>
-          )}
-          <span className="text-amber-200/40 ml-2 text-[11px]">
-            准确率 {(consensusAcc * 100).toFixed(0)}%
-          </span>
+        <div className="ml-auto text-right">
+          {/* SPEC_L2_V3.5b — primary headline is the on-niche expert vote.
+              Falls back to a "尚无 X 专家" hint when no specialist of the
+              current oracle's mode exists yet (consensusVotersSwarm == 0). */}
+          <div>
+            <span className="text-amber-200/60">专家共识: </span>
+            {consensusBitSwarm === null || consensusVotersSwarm === 0 ? (
+              <span className="text-slate-500 text-[12px]">
+                尚无 {oracle.mode_name} 专家
+              </span>
+            ) : (
+              <span
+                className={clsx(
+                  "font-bold text-base",
+                  consensusBitSwarm === oracle.target_bit
+                    ? "text-emerald-300"
+                    : "text-rose-300"
+                )}
+              >
+                [{consensusBitSwarm}]
+              </span>
+            )}
+            {consensusVotersSwarm > 0 && (
+              <span className="text-amber-200/40 ml-2 text-[11px] numeric">
+                准确率 {(consensusAccSwarm * 100).toFixed(0)}%
+                <span className="text-slate-500"> · 投票 {consensusVotersSwarm}</span>
+              </span>
+            )}
+          </div>
+          {/* Legacy whole-population consensus, demoted to footnote — under
+              speciation it gets diluted by silent off-niche voters and was
+              the source of "好像不行" mis-reads. */}
+          <div className="text-[10px] text-slate-500 mt-0.5">
+            <span className="text-slate-500">全员均值: </span>
+            {consensus === null ? (
+              <span>—</span>
+            ) : (
+              <span className={clsx("numeric", correct ? "text-slate-400" : "text-slate-500")}>
+                [{consensus}]·{(consensusAcc * 100).toFixed(0)}%
+              </span>
+            )}
+          </div>
         </div>
       </div>
       <div className="text-[12px] text-amber-100/80 italic leading-relaxed">
-        {evaluationComment(oracle, consensus, consensusAcc, accAnd, accNot)}
+        {evaluationComment(
+          oracle,
+          consensusBitSwarm ?? consensus,
+          consensusVotersSwarm > 0 ? consensusAccSwarm : consensusAcc,
+          accAnd,
+          accNot,
+        )}
       </div>
     </div>
   );
@@ -221,54 +299,61 @@ function SpecificAccuracy({
   accAnd,
   accNot,
   difficulty,
+  accAnd11Swarm,
+  accNot0Swarm,
 }: {
   accAnd11: number;
   accNot0: number;
   accAnd: number;
   accNot: number;
   difficulty: TaskDifficulty;
+  // SPEC_L2_V3.5b — niche-aware "真学会" rates.  Pop-versions become footnotes.
+  accAnd11Swarm: number;
+  accNot0Swarm: number;
 }) {
   const ceil = SILENT_CEILING_BY_DIFFICULTY[difficulty] ?? SILENT_CEILING_BY_DIFFICULTY.balanced;
-  // "Silent gap" — how much of the headline acc is *not* explained by真学会.
-  // Big gap on a healthy-looking温度计 = silent attractor in disguise.
-  const andGap = Math.max(0, accAnd - accAnd11 * 0.25);
-  const notGap = Math.max(0, accNot - accNot0 * 0.5);
-  const verdict = verdictFor(accAnd11, accNot0, accAnd, accNot);
+  // Use the swarm version as the headline — it doesn't get diluted by the
+  // silent off-niche majority that v3.5 speciation creates.
+  const headlineAnd = accAnd11Swarm > 0 ? accAnd11Swarm : accAnd11;
+  const headlineNot = accNot0Swarm > 0 ? accNot0Swarm : accNot0;
+  const andGap = Math.max(0, accAnd - headlineAnd * 0.25);
+  const notGap = Math.max(0, accNot - headlineNot * 0.5);
+  const verdict = verdictFor(headlineAnd, headlineNot, accAnd, accNot);
   return (
     <div className="rounded border border-cyan-700/40 bg-cyan-950/20 p-3 space-y-2">
       <div className="flex items-baseline justify-between">
         <span className="text-xs font-semibold text-cyan-100">
-          🎯 真学会率（特异性仪表盘）
+          🎯 真学会率（专家投票，v3.5b）
         </span>
         <span className="text-[11px] text-cyan-200/60 font-mono">
-          v2.3.1 · 难度={difficulty}
+          只统计对应 niche 的专家 · 难度={difficulty}
         </span>
       </div>
       <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
         <SpecBar
-          label="1 AND 1 = 1 命中率"
-          value={accAnd11}
-          mixed={accAnd}
-          mixedLabel="acc_AND 混合"
+          label="1 AND 1 = 1 命中率（AND 专家）"
+          value={headlineAnd}
+          mixed={accAnd11}
+          mixedLabel="全员均值 acc_and_11_pop"
           silentCeiling={ceil.and}
           color="emerald"
-          hint="真学会的唯一证据 — 这一项不上升，AND 温度计的高分都是错觉。"
+          hint="只算 AND 专家投票。沉默的 NOT 专家不被算作答错——这才是真『AND 学会率』。"
         />
         <SpecBar
-          label="NOT 0 = 1 命中率"
-          value={accNot0}
-          mixed={accNot}
-          mixedLabel="acc_NOT 混合"
+          label="NOT 0 = 1 命中率（NOT 专家）"
+          value={headlineNot}
+          mixed={accNot0}
+          mixedLabel="全员均值 acc_not_0_pop"
           silentCeiling={ceil.not}
           color="rose"
-          hint="NOT 模式的『启蒙』指标 — 沉默个体在此恒等于 0。"
+          hint="只算 NOT 专家投票。AND 专家的沉默不再拉低分母。"
         />
       </div>
       <div className="text-[12px] text-cyan-100/85 italic leading-relaxed">
         {verdict}
         {(andGap > 0.15 || notGap > 0.15) && (
           <span className="text-amber-300/90 not-italic">
-            {" "}· ⚠ 温度计 vs. 真学会率出现明显落差，怀疑「沉默搭便车」。
+            {" "}· ⚠ 全员均值与专家投票差距大，正是物种共存（v3.5）的预期表征。
           </span>
         )}
       </div>
@@ -363,33 +448,42 @@ function SpecBar({
 function TruthTableMatrix({
   rowAcc,
   rowN,
+  rowAccSwarm,
+  rowNSwarm,
 }: {
   rowAcc: RowAccuracies;
   rowN: RowAccuracies;
+  // SPEC_L2_V3.5b — niche-aware row accuracy + voter count.  Same keys.
+  rowAccSwarm?: RowAccuracies | null;
+  rowNSwarm?: RowAccuracies | null;
 }) {
   const rows: Array<{
     key: keyof RowAccuracies;
     label: string;
     target: 0 | 1;
+    niche: "AND" | "NOT";
   }> = [
-    { key: "and_00", label: "AND (0,0) → 0", target: 0 },
-    { key: "and_01", label: "AND (0,1) → 0", target: 0 },
-    { key: "and_10", label: "AND (1,0) → 0", target: 0 },
-    { key: "and_11", label: "AND (1,1) → 1", target: 1 },
-    { key: "not_a0", label: "NOT (a=0) → 1", target: 1 },
-    { key: "not_a1", label: "NOT (a=1) → 0", target: 0 },
+    { key: "and_00", label: "AND (0,0) → 0", target: 0, niche: "AND" },
+    { key: "and_01", label: "AND (0,1) → 0", target: 0, niche: "AND" },
+    { key: "and_10", label: "AND (1,0) → 0", target: 0, niche: "AND" },
+    { key: "and_11", label: "AND (1,1) → 1", target: 1, niche: "AND" },
+    { key: "not_a0", label: "NOT (a=0) → 1", target: 1, niche: "NOT" },
+    { key: "not_a1", label: "NOT (a=1) → 0", target: 0, niche: "NOT" },
   ];
   return (
     <details className="rounded border border-amber-800/30 bg-amber-950/20 p-3">
       <summary className="cursor-pointer text-xs font-semibold text-amber-100 hover:text-amber-50">
-        🔬 完整真值表（6 行细分准确率） — 看每一题真学会了多少
+        🔬 完整真值表（6 行细分准确率） — 专家投票 + 全员均值
       </summary>
       <div className="mt-3 grid grid-cols-2 md:grid-cols-3 gap-2">
         {rows.map((r) => {
-          const acc = rowAcc[r.key];
-          const n = rowN[r.key];
+          const accPop = rowAcc[r.key];
+          const nPop = rowN[r.key];
+          const accSwarm = rowAccSwarm ? rowAccSwarm[r.key] : 0;
+          const nSwarm = rowNSwarm ? rowNSwarm[r.key] : 0;
+          const headline = nSwarm > 0 ? accSwarm : accPop;
           const isTargetOne = r.target === 1;
-          const dim = n < 5;
+          const dim = nPop < 5 && nSwarm < 5;
           return (
             <div
               key={r.key}
@@ -411,7 +505,7 @@ function TruthTableMatrix({
                   {r.label}
                 </span>
                 <span className="text-sm font-mono numeric text-amber-100">
-                  {(acc * 100).toFixed(0)}%
+                  {(headline * 100).toFixed(0)}%
                 </span>
               </div>
               <div className="mt-1 h-1.5 rounded bg-slate-900/80 overflow-hidden">
@@ -420,19 +514,28 @@ function TruthTableMatrix({
                     "h-full transition-[width] duration-300",
                     isTargetOne ? "bg-emerald-400" : "bg-slate-500"
                   )}
-                  style={{ width: `${Math.max(0, Math.min(1, acc)) * 100}%` }}
+                  style={{ width: `${Math.max(0, Math.min(1, headline)) * 100}%` }}
                 />
               </div>
-              <div className="text-[10px] text-amber-200/50 mt-0.5 numeric">
-                n={n} 窗 {dim && "(样本不足)"}
+              <div className="text-[10px] text-amber-200/60 mt-0.5 numeric leading-tight">
+                {nSwarm > 0 ? (
+                  <>
+                    {r.niche} 专家 {nSwarm} 票 · {(accSwarm * 100).toFixed(0)}%
+                  </>
+                ) : (
+                  <span className="text-slate-500">尚无 {r.niche} 专家投票</span>
+                )}
+              </div>
+              <div className="text-[10px] text-slate-500 numeric leading-tight">
+                全员均值 {(accPop * 100).toFixed(0)}% · n={nPop}
               </div>
             </div>
           );
         })}
       </div>
       <div className="mt-2 text-[11px] text-amber-200/60 leading-relaxed">
-        绿底 = target=1 的题目（沉默上限 0%）；灰底 = target=0 的题目（沉默上限 100%）。
-        想确认演化「真懂」，盯绿底两栏的进度。
+        头条数字 = 对应 niche 专家的投票准确率；下方灰字是全员均值（含沉默的非专业 niche，
+        会被稀释）。绿底 = target=1 的题目，是验证「真懂」的硬证据。
       </div>
     </details>
   );
@@ -527,6 +630,200 @@ function ProgressBar({
         )}
       </div>
       <div className="mt-1 text-[11px] text-amber-200/50">{sub}</div>
+    </div>
+  );
+}
+
+// ── SPEC_L2_V3.5 — species coexistence panel ────────────────────────────
+// After the v3.4 admixture failure (§5.13 ERRATA) we accept that L2 dual-logic
+// lives in the colony as a community of two specialists, not in a single agent.
+// The four-quadrant census + colony_dual_acc are the new success indicators:
+//   - and_expert / not_expert columns ≈ equal counts → healthy speciation
+//   - colony_dual_acc > 0 → both species exist in sufficient numbers AND each
+//     species solves its own task — this is the new L2 pass criterion.
+
+function SpeciesPanel({
+  counts,
+  accAndSwarm,
+  accNotSwarm,
+  colonyDualAcc,
+  assortativeT,
+  totalAlive,
+}: {
+  counts: { novice: number; and_expert: number; not_expert: number; dual_expert: number };
+  accAndSwarm: number;
+  accNotSwarm: number;
+  colonyDualAcc: number;
+  assortativeT: number | null;
+  totalAlive: number;
+}) {
+  const total = Math.max(1, counts.novice + counts.and_expert + counts.not_expert + counts.dual_expert);
+  const pctAnd = (counts.and_expert / total) * 100;
+  const pctNot = (counts.not_expert / total) * 100;
+  const pctDual = (counts.dual_expert / total) * 100;
+  const pctNovice = (counts.novice / total) * 100;
+  const balanced = counts.and_expert >= 10 && counts.not_expert >= 10;
+  const tLabel = assortativeT === null ? "off (legacy)" : `T=${assortativeT.toFixed(2)}`;
+
+  return (
+    <div className="rounded border border-emerald-700/50 bg-emerald-950/15 p-3">
+      <div className="flex items-baseline justify-between mb-2">
+        <div className="text-xs font-semibold text-emerald-100">
+          🧬 物种结构 · SPEC_L2_V3.5
+        </div>
+        <div className="text-[10px] font-mono text-emerald-200/60">
+          assortative HGT: {tLabel} · alive={totalAlive}
+        </div>
+      </div>
+
+      {/* Stacked bar: 四种基因型分布 */}
+      <div className="flex h-5 rounded overflow-hidden border border-emerald-800/60 mb-2">
+        {pctAnd > 0 && (
+          <div
+            className="bg-cyan-400 text-[10px] text-slate-950 flex items-center justify-center font-mono"
+            style={{ width: `${pctAnd}%` }}
+            title={`AND-experts: ${counts.and_expert}`}
+          >
+            {pctAnd >= 8 ? `AND ${pctAnd.toFixed(0)}%` : ""}
+          </div>
+        )}
+        {pctDual > 0 && (
+          <div
+            className="bg-amber-300 text-[10px] text-slate-950 flex items-center justify-center font-mono"
+            style={{ width: `${pctDual}%` }}
+            title={`Dual-experts: ${counts.dual_expert}`}
+          >
+            {pctDual >= 8 ? `DUAL ${pctDual.toFixed(0)}%` : ""}
+          </div>
+        )}
+        {pctNot > 0 && (
+          <div
+            className="bg-fuchsia-400 text-[10px] text-slate-950 flex items-center justify-center font-mono"
+            style={{ width: `${pctNot}%` }}
+            title={`NOT-experts: ${counts.not_expert}`}
+          >
+            {pctNot >= 8 ? `NOT ${pctNot.toFixed(0)}%` : ""}
+          </div>
+        )}
+        {pctNovice > 0 && (
+          <div
+            className="bg-slate-700 text-[10px] text-slate-300 flex items-center justify-center font-mono"
+            style={{ width: `${pctNovice}%` }}
+            title={`Novice / untrained: ${counts.novice}`}
+          >
+            {pctNovice >= 8 ? `novice ${pctNovice.toFixed(0)}%` : ""}
+          </div>
+        )}
+      </div>
+
+      <div className="grid grid-cols-4 gap-1 text-[10px] font-mono numeric mb-2">
+        <SpeciesCell color="cyan" label="AND" count={counts.and_expert} />
+        <SpeciesCell color="amber" label="DUAL" count={counts.dual_expert} />
+        <SpeciesCell color="fuchsia" label="NOT" count={counts.not_expert} />
+        <SpeciesCell color="slate" label="novice" count={counts.novice} />
+      </div>
+
+      {/* swarm-level accuracies (only the experts vote on their own task) */}
+      <div className="grid grid-cols-3 gap-2">
+        <SwarmStat
+          label="AND 专家投票"
+          value={accAndSwarm}
+          color="cyan"
+          enabled={counts.and_expert > 0 || counts.dual_expert > 0}
+        />
+        <SwarmStat
+          label="NOT 专家投票"
+          value={accNotSwarm}
+          color="fuchsia"
+          enabled={counts.not_expert > 0 || counts.dual_expert > 0}
+        />
+        <SwarmStat
+          label="colony_dual_acc"
+          value={colonyDualAcc}
+          color={balanced ? "emerald" : "slate"}
+          enabled={balanced}
+          highlight
+        />
+      </div>
+
+      <div className="text-[10px] text-emerald-200/60 mt-2 leading-snug">
+        {balanced ? (
+          <>
+            ✅ 两个物种都达到投票门槛（≥10 个体 + acc≥0.65）。
+            <b>colony_dual_acc</b> 是 v3.5 的 L2 成功判据——
+            它非零意味着菌落整体可以解决「AND + NOT」复合任务，
+            即使没有任何单细胞做到「双修」。
+          </>
+        ) : (
+          <>
+            ⏳ 还没有形成稳定的双物种结构。
+            colony_dual_acc 需要 AND-experts 和 NOT-experts 各 ≥ 10 个、
+            且各自的 mode 准确率 ≥ 0.65。
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function SpeciesCell({
+  color,
+  label,
+  count,
+}: {
+  color: "cyan" | "fuchsia" | "amber" | "slate";
+  label: string;
+  count: number;
+}) {
+  const palette: Record<string, string> = {
+    cyan: "bg-cyan-950/40 text-cyan-200 border-cyan-700/50",
+    fuchsia: "bg-fuchsia-950/40 text-fuchsia-200 border-fuchsia-700/50",
+    amber: "bg-amber-950/40 text-amber-200 border-amber-700/50",
+    slate: "bg-slate-900/60 text-slate-300 border-slate-700/50",
+  };
+  return (
+    <div
+      className={clsx("rounded border px-1.5 py-1 flex items-baseline justify-between", palette[color])}
+    >
+      <span>{label}</span>
+      <span className="font-semibold">{count}</span>
+    </div>
+  );
+}
+
+function SwarmStat({
+  label,
+  value,
+  color,
+  enabled,
+  highlight,
+}: {
+  label: string;
+  value: number;
+  color: "cyan" | "fuchsia" | "emerald" | "slate";
+  enabled: boolean;
+  highlight?: boolean;
+}) {
+  const palette: Record<string, string> = {
+    cyan: "border-cyan-700/50 text-cyan-100 bg-cyan-950/30",
+    fuchsia: "border-fuchsia-700/50 text-fuchsia-100 bg-fuchsia-950/30",
+    emerald: "border-emerald-500/70 text-emerald-100 bg-emerald-900/30",
+    slate: "border-slate-700/50 text-slate-300 bg-slate-900/40",
+  };
+  const dim = !enabled ? "opacity-50" : "";
+  return (
+    <div
+      className={clsx(
+        "rounded border px-2 py-1.5 numeric",
+        palette[color],
+        dim,
+        highlight && "ring-1 ring-emerald-300/40"
+      )}
+    >
+      <div className="text-[10px] opacity-80">{label}</div>
+      <div className={clsx("font-mono font-semibold", highlight ? "text-base" : "text-sm")}>
+        {enabled ? `${(value * 100).toFixed(1)}%` : "— "}
+      </div>
     </div>
   );
 }

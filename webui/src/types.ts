@@ -38,14 +38,31 @@ export interface SimConfig {
   task: SimTask;
   // Environment-shaping difficulty (only used for l2v2_ctrl task).
   task_difficulty: TaskDifficulty;
-  // SPEC_L2_V3.0 §1.3 — admixture experiment (杂交皿).
+  // SPEC_L2_V3.0 / V3.4 — admixture experiment (杂交皿).
   // When founders is non-empty, the initial slots are filled by sampling each
   // strain's living gene pool with the given fraction (sum ≤ 1; remainder is
-  // random as usual). admixture_window_s > 0 boosts hgt_prob ×multiplier for
-  // the first N sim-seconds to model two cultures meeting in a fresh dish.
+  // random as usual).
+  //
+  // v3.4 — 3-phase ecological admixture protocol (replaces the v3.0 single
+  // "boost window" model that caused the dominant strain to sweep the dish):
+  //   Phase 1 (commensal, HGT entirely OFF):  0 .. admixture_commensal_s
+  //   Phase 2 (controlled exchange, low blend):
+  //                                           commensal_s .. commensal_s + exchange_s
+  //   Phase 3 (restored, baseline HGT):       afterwards
+  // Defaults of 0/0 disable the protocol — colony runs as a normal sim from t=0.
   founders?: FounderSpec[] | null;
-  admixture_window_s?: number;
-  admixture_hgt_multiplier?: number;
+  admixture_commensal_s?: number;
+  admixture_exchange_s?: number;
+  admixture_phase2_blend?: number;
+  admixture_phase2_prob_mul?: number;
+  // SPEC_L2_V3.5 — assortative HGT (prezygotic isolation by niche similarity).
+  //   null     = legacy / disabled (richest-neighbour wins, v3.4 bit-identical)
+  //   0        = strict speciation (only the closest-niche donor can transfer)
+  //   0 < T < ∞ = soft niche preference (∝ exp(-|Δniche|/T))
+  // Together with strain mixing (founders), this is the v3.5 answer to
+  // genome-incompatibility: instead of forcing AND/NOT specialists to hybridise,
+  // we let each species exchange genes only within its own kind.
+  assortative_temperature?: number | null;
 }
 
 // SPEC_L2_V3.0 §1.3 — one entry in the founders list.
@@ -144,11 +161,55 @@ export interface TelemetryEvent {
   row_acc?: RowAccuracies | null;
   row_n?: RowAccuracies | null;
   task_difficulty?: TaskDifficulty | null;
-  // SPEC_L2_V3.0 §1.3 — admixture telemetry.
+  // SPEC_L2_V3.4 — 3-phase admixture telemetry.
+  // admixture_phase: 1 = commensal (HGT off), 2 = controlled exchange,
+  //                  3 = restored / no protocol active.
+  // admixture_active is true iff phase ∈ {1, 2}.
+  admixture_phase?: 1 | 2 | 3;
   admixture_active?: boolean;
-  admixture_window_s?: number;
-  admixture_hgt_multiplier?: number;
+  admixture_commensal_s?: number;
+  admixture_exchange_s?: number;
+  admixture_phase2_blend?: number;
+  admixture_phase2_prob_mul?: number;
   eff_hgt_prob?: number;
+  eff_hgt_blend?: number;
+  // SPEC_L2_V3.5 — niche-aware swarm-level dual-logic metrics + species census.
+  // colony_dual_acc is the canonical L2-success indicator under the species-
+  // coexistence model: it is non-zero only when both AND-experts and
+  // NOT-experts are present in sufficient numbers (see NICHE_MIN_SAMPLES).
+  acc_and_swarm?: number;
+  acc_not_swarm?: number;
+  colony_dual_acc?: number;
+  species_counts?: SpeciesCounts | null;
+  // null = legacy / disabled (∞); a number = active assortative temperature.
+  assortative_temperature?: number | null;
+  // SPEC_L2_V3.5b — niche-aware "评测层" surface.
+  // - consensus_acc_swarm:  consensus_acc but only on-niche voters count.
+  // - consensus_voters_swarm: how many on-niche voters backed the bit (0 = no
+  //                           specialists exist for this oracle's mode yet).
+  // - acc_and_11_swarm / acc_not_0_swarm: same as the *_pop headlines but
+  //                          only on-niche voters contribute, so silent
+  //                          off-niche agents stop dragging the average.
+  // - row_acc_swarm / row_n_swarm: parallel 6-row table (same keys as row_acc)
+  consensus_acc_swarm?: number;
+  consensus_bit_swarm?: 0 | 1 | null;
+  consensus_voters_swarm?: number;
+  acc_and_11_swarm?: number;
+  acc_not_0_swarm?: number;
+  row_acc_swarm?: RowAccuracies | null;
+  row_n_swarm?: RowAccuracies | null;
+}
+
+// SPEC_L2_V3.5 — four-quadrant census of the colony's logical specialization.
+// novice = below threshold on both modes (incl. untrained newborns);
+// dual_expert ≥ threshold on both — the "rare hybrid" the v3.4 admixture failed
+// to produce reliably; species-coexistence treats and_expert + not_expert as
+// the success state, with dual_expert as a bonus.
+export interface SpeciesCounts {
+  novice: number;
+  and_expert: number;
+  not_expert: number;
+  dual_expert: number;
 }
 
 export interface HelloEvent {
@@ -174,9 +235,24 @@ export interface SimStatus {
   feedback_count: number;
 }
 
+// SPEC_L2_V3.5b — niche-aware inference targets.
+//   colony       : route by f_s_hz (low → and_expert, high → not_expert)
+//   and_expert   : top-K AND-or-DUAL specialists, ranked by acc_AND
+//   not_expert   : top-K NOT-or-DUAL specialists, ranked by acc_NOT
+//   dual_expert  : DUAL specialists only (rare; mostly diagnostic)
+export type InferenceTarget =
+  | "best"
+  | "ensemble"
+  | "random"
+  | "swarm"
+  | "colony"
+  | "and_expert"
+  | "not_expert"
+  | "dual_expert";
+
 export interface InferenceRequest {
   f_in_hz: number;
-  target: "best" | "ensemble" | "random" | "swarm";
+  target: InferenceTarget;
   top_k: number;
   duration_ms: number;
   warmup_ms: number;
@@ -203,6 +279,14 @@ export interface InferenceResponse extends InferenceResponseExtras {
   task?: SimTask;
   f_out_hz: number;
   target: string;
+  // SPEC_L2_V3.5b — niche routing surfaces:
+  // - target_resolved : the actual target the runtime used (e.g. 'colony'
+  //   with f_s ≈ 80 Hz → 'not_expert'; 'and_expert' with no AND specialist
+  //   → 'ensemble').
+  // - target_degraded : reason for fallback (e.g. 'no_not_expert_specialist',
+  //   'no_f_s_for_routing'); null when the requested niche was honoured.
+  target_resolved?: string;
+  target_degraded?: string | null;
   duration_ms: number;
   warmup_ms: number;
   agents: InferenceAgentResult[];
@@ -216,7 +300,7 @@ export interface SweepRequest {
   f_in_min: number;
   f_in_max: number;
   n_points: number;
-  target: "best" | "ensemble" | "random" | "swarm";
+  target: InferenceTarget;
   top_k: number;
   duration_ms: number;
   warmup_ms: number;

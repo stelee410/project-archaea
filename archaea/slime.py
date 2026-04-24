@@ -46,6 +46,13 @@ DEFAULT_HGT_COST = 5.0
 DEFAULT_HGT_DONOR_RATIO = 2.0  # donor.credit must be ≥ this × recipient.credit
 DEFAULT_MIGRATE_PROB = 0.30
 
+# SPEC_L2_V3.5 — assortative HGT (prezygotic isolation by niche similarity).
+# When `niche` array is supplied to hgt_pairs(), the donor is sampled with
+# probability ∝ exp(-|Δniche|/T) instead of "richest in radius".  T → 0 means
+# strict same-niche (the closest neighbor in niche space wins, even if poorer);
+# T = ∞ recovers the SPEC v1.1 "richest tie-break" behavior bit-identically.
+DEFAULT_ASSORTATIVE_TEMPERATURE = float("inf")
+
 
 @dataclass
 class SlimeConfig:
@@ -228,6 +235,8 @@ def hgt_pairs(
     radius: int,
     prob: float,
     donor_ratio: float,
+    niche: np.ndarray | None = None,
+    assortative_temperature: float = DEFAULT_ASSORTATIVE_TEMPERATURE,
 ) -> list[tuple[int, int]]:
     """
     Decide HGT (recipient, donor) pairs for this window.
@@ -238,10 +247,26 @@ def hgt_pairs(
 
     Returns a list of (recipient_index, donor_index) into the supplied arrays
     — caller maps back to absolute slot ids.
+
+    SPEC_L2_V3.5 — donor selection has two regimes:
+
+    - ``niche is None`` or ``assortative_temperature == ∞``: legacy behavior.
+      Among credit-eligible donors in radius, pick the richest (tie-break
+      random).  Bit-identical to SPEC v1.1.
+    - ``niche`` provided + finite ``assortative_temperature``: prezygotic
+      reproductive isolation.  Donor is sampled from credit-eligible candidates
+      with probability ∝ exp(-|niche[d] - niche[i]| / T).  T → 0 means strict
+      same-niche (only the closest neighbor in niche space gets picked); larger
+      T relaxes the preference.  This implements assortative gene flow — AND
+      specialists tend to exchange genes with AND specialists, NOT with NOT,
+      preventing the "asymmetric pollution" failure documented in §5.12 ERRATA.
     """
     n = positions.shape[0]
     if n < 2 or prob <= 0.0:
         return []
+    use_assortative = (
+        niche is not None and np.isfinite(assortative_temperature)
+    )
     pairs: list[tuple[int, int]] = []
     # Pre-roll dice for speed
     rolls = rng.random(n)
@@ -263,11 +288,27 @@ def hgt_pairs(
         donors_mask = cand_credit >= max(1e-6, donor_ratio * my_credit)
         if not np.any(donors_mask):
             continue
-        # Pick the richest donor; tie-break random
         candidates = np.flatnonzero(donors_mask)
-        max_c = float(cand_credit[candidates].max())
-        top = candidates[np.isclose(cand_credit[candidates], max_c)]
-        donor = int(rng.choice(top))
+        if use_assortative:
+            # Niche-similarity-weighted sample.
+            niche_dist = np.abs(niche[candidates] - niche[i]).astype(np.float64)
+            T = max(float(assortative_temperature), 1e-6)
+            logits = -niche_dist / T
+            logits -= logits.max()  # numerical stability
+            weights = np.exp(logits)
+            total = float(weights.sum())
+            if total <= 0.0 or not np.isfinite(total):
+                # All weights underflowed to 0 (extreme T → 0 with diverse niches);
+                # fall through to picking the strictly closest donor.
+                donor = int(candidates[int(np.argmin(niche_dist))])
+            else:
+                probs = weights / total
+                donor = int(rng.choice(candidates, p=probs))
+        else:
+            # Legacy: pick richest, tie-break random.
+            max_c = float(cand_credit[candidates].max())
+            top = candidates[np.isclose(cand_credit[candidates], max_c)]
+            donor = int(rng.choice(top))
         pairs.append((i, donor))
     return pairs
 

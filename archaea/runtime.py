@@ -12,6 +12,7 @@ remains the canonical SPEC-compliant runner.
 from __future__ import annotations
 
 import asyncio
+import math
 import threading
 import time
 from dataclasses import dataclass, field
@@ -75,11 +76,26 @@ class SimConfig:
     task_difficulty: str = "balanced"
     # SPEC_L2_V3.0 — admixture experiment (杂交皿).  When founders is non-empty
     # the initial slots are seeded by sampling from saved strains instead of
-    # random init; admixture_window_s + multiplier give a burst of HGT for the
-    # first N seconds to model two cultures meeting.
+    # random init.
     founders: list[dict] | None = None
-    admixture_window_s: float = 0.0
-    admixture_hgt_multiplier: float = 5.0
+    # SPEC_L2_V3.4 — 3-phase ecological admixture protocol (replaces v3.0
+    # single-window HGT boost; see population.py for the full rationale).
+    #   Phase 1 (commensal, HGT off):   0 .. admixture_commensal_s
+    #   Phase 2 (controlled exchange):  commensal_s .. commensal_s + exchange_s
+    #   Phase 3 (baseline restored):    afterwards
+    # Defaults of 0/0 disable the protocol entirely (colony runs as if no
+    # admixture machinery existed; equivalent to a normal sim from t=0).
+    admixture_commensal_s: float = 0.0
+    admixture_exchange_s: float = 0.0
+    admixture_phase2_blend: float = 0.05
+    admixture_phase2_prob_mul: float = 1.0
+    # SPEC_L2_V3.5 — assortative HGT (prezygotic isolation by niche similarity).
+    # None → SPEC v3.4 behavior bit-identical (richest neighbour wins).
+    # A finite float weights donor sampling by exp(-|Δniche|/T) where
+    # niche = acc_AND - acc_NOT, so AND specialists tend to swap genes with AND
+    # specialists, NOT with NOT.  T → 0 is "strict speciation" — only the
+    # closest-niche neighbour can donate.  None is JSON-friendly; ∞ would not be.
+    assortative_temperature: float | None = None
 
     def normalized(self) -> "SimConfig":
         return SimConfig(
@@ -105,8 +121,17 @@ class SimConfig:
             task=validate_task(self.task),
             task_difficulty=str(self.task_difficulty),
             founders=(list(self.founders) if self.founders else None),
-            admixture_window_s=float(max(0.0, self.admixture_window_s)),
-            admixture_hgt_multiplier=float(max(1.0, self.admixture_hgt_multiplier)),
+            admixture_commensal_s=float(max(0.0, self.admixture_commensal_s)),
+            admixture_exchange_s=float(max(0.0, self.admixture_exchange_s)),
+            admixture_phase2_blend=float(
+                min(1.0, max(0.0, self.admixture_phase2_blend))
+            ),
+            admixture_phase2_prob_mul=float(max(0.0, self.admixture_phase2_prob_mul)),
+            assortative_temperature=(
+                None
+                if self.assortative_temperature is None
+                else float(max(0.0, self.assortative_temperature))
+            ),
         )
 
     def to_slime_config(self) -> SlimeConfig:
@@ -244,12 +269,16 @@ class SimulationRuntime:
                     )
                 )
 
-        # When admixture window is requested but slime is off, auto-enable
-        # spatial + HGT (otherwise HGT cannot trigger).  Force the reward bonus
-        # OFF — v2.x debugging proved pheromone_bonus_k > 0 distorts L2v2 oracle
-        # rewards into a silent attractor (see project-summary.md §5.7).
+        # When the admixture protocol is requested but slime is off, auto-enable
+        # spatial + HGT so the controlled-exchange phase actually has a substrate.
+        # Force the reward bonus OFF — v2.x debugging proved pheromone_bonus_k > 0
+        # distorts L2v2 oracle rewards into a silent attractor (project-summary §5.7).
         slime_cfg = cfg.to_slime_config()
-        if cfg.admixture_window_s > 0.0 and founder_injections:
+        admixture_active_protocol = (
+            (cfg.admixture_commensal_s > 0.0 or cfg.admixture_exchange_s > 0.0)
+            and founder_injections
+        )
+        if admixture_active_protocol:
             slime_cfg.enabled = True
             slime_cfg.hgt_enabled = True
             slime_cfg.pheromone_bonus_k = 0.0  # critical: keep reward clean
@@ -272,8 +301,16 @@ class SimulationRuntime:
                 task=cfg.task,
                 task_difficulty=cfg.task_difficulty,
                 founders=(founder_injections or None),
-                admixture_window_s=cfg.admixture_window_s,
-                admixture_hgt_multiplier=cfg.admixture_hgt_multiplier,
+                admixture_commensal_s=cfg.admixture_commensal_s,
+                admixture_exchange_s=cfg.admixture_exchange_s,
+                admixture_phase2_blend=cfg.admixture_phase2_blend,
+                admixture_phase2_prob_mul=cfg.admixture_phase2_prob_mul,
+                # Population still uses ∞ as the legacy sentinel internally.
+                assortative_temperature=(
+                    float("inf")
+                    if cfg.assortative_temperature is None
+                    else float(cfg.assortative_temperature)
+                ),
             )
             self._t_sim = 0.0
             self._last_event = None
@@ -368,26 +405,21 @@ class SimulationRuntime:
         swarm_hotspot: list[int] | None = None
         swarm_radius_used: int | None = None
         swarm_degraded: str | None = None
+        target_resolved: str = target
+        target_degraded: str | None = None
         with self._lock:
             if self._pop is None:
                 raise RuntimeError("simulation not initialized")
             pop = self._pop
-            if target == "best":
-                slots = pop.top_k_slots(1, by="fitness").tolist()
-            elif target == "ensemble":
-                slots = pop.top_k_slots(max(1, int(top_k)), by="fitness").tolist()
-            elif target == "random":
-                idx = pop.living_indices()
-                if idx.size == 0:
-                    slots = []
-                else:
-                    slots = [int(self._inference_rng.choice(idx))]
-            elif target == "swarm":
-                slots, swarm_hotspot, swarm_radius_used, swarm_degraded = (
-                    self._select_swarm_slots(pop, max(1, int(top_k)), int(swarm_radius))
+            slots, swarm_hotspot, swarm_radius_used, swarm_degraded, target_resolved, target_degraded = (
+                self._resolve_query_target(
+                    pop,
+                    target,
+                    top_k,
+                    swarm_radius,
+                    f_s_hz,
                 )
-            else:
-                raise ValueError(f"unknown target: {target}")
+            )
             if not slots:
                 raise RuntimeError("no living agents to query")
             weights_per = [pop.weights[int(s)].copy() for s in slots]
@@ -463,6 +495,11 @@ class SimulationRuntime:
             "task": current_task,
             "f_out_hz": f_out_mean,
             "target": target,
+            # SPEC_L2_V3.5b — what the runtime actually used after auto-routing
+            # / fallback (e.g. target='colony' with f_s=80Hz → 'not_expert';
+            # 'and_expert' on a colony with no AND specialists → 'ensemble').
+            "target_resolved": target_resolved,
+            "target_degraded": target_degraded,
             "duration_ms": duration_ms,
             "warmup_ms": warmup_ms,
             "agents": [
@@ -527,22 +564,16 @@ class SimulationRuntime:
             if self._pop is None:
                 raise RuntimeError("simulation not initialized")
             pop = self._pop
-            if target == "best":
-                slots = pop.top_k_slots(1, by="fitness").tolist()
-            elif target == "ensemble":
-                slots = pop.top_k_slots(max(1, int(top_k)), by="fitness").tolist()
-            elif target == "random":
-                idx = pop.living_indices()
-                if idx.size == 0:
-                    slots = []
-                else:
-                    slots = [int(self._inference_rng.choice(idx))]
-            elif target == "swarm":
-                slots, meta_hotspot, meta_radius, meta_degraded = (
-                    self._select_swarm_slots(pop, max(1, int(top_k)), int(swarm_radius))
+            slots, meta_hotspot, meta_radius, meta_degraded, _, _ = (
+                self._resolve_query_target(
+                    pop,
+                    target,
+                    top_k,
+                    swarm_radius,
+                    f_s_hz=None,  # sweep doesn't carry an f_s — niche routing
+                                  # falls back to ensemble for any 'colony'/'auto'.
                 )
-            else:
-                raise ValueError(f"unknown target: {target}")
+            )
             if not slots:
                 raise RuntimeError("no living agents to query")
             weights_per = [pop.weights[int(s)].copy() for s in slots]
@@ -642,6 +673,102 @@ class SimulationRuntime:
             },
             "synapse_gain": inference_gain,
         }
+
+    def _resolve_query_target(
+        self,
+        pop: Population,
+        target: str,
+        top_k: int,
+        swarm_radius: int,
+        f_s_hz: float | None,
+    ) -> tuple[
+        list[int],
+        list[int] | None,
+        int | None,
+        str | None,
+        str,
+        str | None,
+    ]:
+        """SPEC_L2_V3.5b — single dispatch point for inference target selection.
+
+        Returns ``(slots, swarm_hotspot, swarm_radius_used, swarm_degraded,
+        target_resolved, target_degraded)``.
+
+        ``target_resolved`` is the *actual* niche/policy used (e.g. ``colony``
+        with f_s ≈ 80 Hz becomes ``not_expert``).  ``target_degraded`` is set
+        when the requested specialist niche is empty so we silently fell back
+        to a general top-K pool — the UI surfaces this as a soft warning.
+        """
+        target_resolved: str = target
+        target_degraded: str | None = None
+        swarm_hotspot: list[int] | None = None
+        swarm_radius_used: int | None = None
+        swarm_degraded: str | None = None
+
+        # ── 'colony' / 'auto' — route by oracle mode (f_s) ─────────────────
+        # f_s low → AND instruction; f_s high → NOT instruction.  Mid-band
+        # (~50 Hz, between S_AND_HZ=20 and S_NOT_HZ=80) is treated as
+        # ambiguous and falls back to plain ensemble.
+        if target in ("colony", "auto"):
+            if f_s_hz is not None:
+                if float(f_s_hz) <= 0.5 * (S_AND_HZ + S_NOT_HZ):
+                    target_resolved = "and_expert"
+                else:
+                    target_resolved = "not_expert"
+            else:
+                target_resolved = "ensemble"
+                target_degraded = "no_f_s_for_routing"
+
+        if target_resolved in ("and_expert", "not_expert", "dual_expert"):
+            picked = pop.top_k_slots_by_niche(
+                max(1, int(top_k)), niche=target_resolved
+            ).tolist()
+            if not picked:
+                # No specialist of that niche — fall back to top-K-by-fitness
+                # so the user still gets an answer, but flag the degradation.
+                target_degraded = f"no_{target_resolved}_specialist"
+                target_resolved = "ensemble"
+                picked = pop.top_k_slots(
+                    max(1, int(top_k)), by="fitness"
+                ).tolist()
+            return (
+                picked,
+                None,
+                None,
+                None,
+                target_resolved,
+                target_degraded,
+            )
+
+        # ── Legacy targets ─────────────────────────────────────────────────
+        if target_resolved == "best":
+            slots = pop.top_k_slots(1, by="fitness").tolist()
+        elif target_resolved == "ensemble":
+            slots = pop.top_k_slots(
+                max(1, int(top_k)), by="fitness"
+            ).tolist()
+        elif target_resolved == "random":
+            idx = pop.living_indices()
+            if idx.size == 0:
+                slots = []
+            else:
+                slots = [int(self._inference_rng.choice(idx))]
+        elif target_resolved == "swarm":
+            slots, swarm_hotspot, swarm_radius_used, swarm_degraded = (
+                self._select_swarm_slots(
+                    pop, max(1, int(top_k)), int(swarm_radius)
+                )
+            )
+        else:
+            raise ValueError(f"unknown target: {target}")
+        return (
+            slots,
+            swarm_hotspot,
+            swarm_radius_used,
+            swarm_degraded,
+            target_resolved,
+            target_degraded,
+        )
 
     @staticmethod
     def _select_swarm_slots(
@@ -896,11 +1023,37 @@ class SimulationRuntime:
                         "row_acc": info.get("row_acc"),
                         "row_n": info.get("row_n"),
                         "task_difficulty": info.get("task_difficulty"),
-                        # SPEC_L2_V3.0 — admixture window state
+                        # SPEC_L2_V3.4 — 3-phase admixture telemetry
+                        "admixture_phase": int(info.get("admixture_phase", 3)),
                         "admixture_active": bool(info.get("admixture_active", False)),
-                        "admixture_window_s": float(info.get("admixture_window_s", 0.0)),
-                        "admixture_hgt_multiplier": float(info.get("admixture_hgt_multiplier", 1.0)),
+                        "admixture_commensal_s": float(
+                            info.get("admixture_commensal_s", 0.0)
+                        ),
+                        "admixture_exchange_s": float(
+                            info.get("admixture_exchange_s", 0.0)
+                        ),
+                        "admixture_phase2_blend": float(
+                            info.get("admixture_phase2_blend", 0.0)
+                        ),
+                        "admixture_phase2_prob_mul": float(
+                            info.get("admixture_phase2_prob_mul", 1.0)
+                        ),
                         "eff_hgt_prob": float(info.get("eff_hgt_prob", 0.0)),
+                        "eff_hgt_blend": float(info.get("eff_hgt_blend", 0.0)),
+                        # SPEC_L2_V3.5 — niche / species / swarm-dual-logic
+                        "acc_and_swarm": float(info.get("acc_and_swarm", 0.0)),
+                        "acc_not_swarm": float(info.get("acc_not_swarm", 0.0)),
+                        "colony_dual_acc": float(info.get("colony_dual_acc", 0.0)),
+                        "species_counts": info.get("species_counts"),
+                        # Population stores ∞ as the legacy sentinel; JSON can't
+                        # carry ∞ so the API surface uses null == "disabled".
+                        "assortative_temperature": (
+                            None
+                            if not math.isfinite(
+                                info.get("assortative_temperature", float("inf"))
+                            )
+                            else float(info["assortative_temperature"])
+                        ),
                     }
                     self._last_event = event
                     subs = list(self._subscribers)

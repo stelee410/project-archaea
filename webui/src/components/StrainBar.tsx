@@ -24,10 +24,22 @@ export function StrainBar({ ev }: { ev: TelemetryEvent | null }) {
   const running = !!status?.running;
   const taskRunning = status?.config?.task ?? null;
   const [saveOpen, setSaveOpen] = useState(false);
+  // SPEC_L2_V3.4 — 3-phase admixture telemetry.
+  const admixPhase = (ev?.admixture_phase ?? 3) as 1 | 2 | 3;
   const admixActive = !!ev?.admixture_active;
-  const windowS = ev?.admixture_window_s ?? 0;
+  const commensalS = ev?.admixture_commensal_s ?? 0;
+  const exchangeS = ev?.admixture_exchange_s ?? 0;
+  const phase2Blend = ev?.admixture_phase2_blend ?? 0;
+  const phase2Mul = ev?.admixture_phase2_prob_mul ?? 1;
+  const effHgtBlend = ev?.eff_hgt_blend ?? 0;
+  const effHgtProb = ev?.eff_hgt_prob ?? 0;
   const tSim = ev?.t_sim ?? 0;
-  const remain = Math.max(0, windowS - tSim);
+  // Time remaining in the *current* phase (so the badge counts down sensibly).
+  const phaseEndsAt =
+    admixPhase === 1 ? commensalS : admixPhase === 2 ? commensalS + exchangeS : 0;
+  const phaseTotal =
+    admixPhase === 1 ? commensalS : admixPhase === 2 ? exchangeS : 0;
+  const remain = Math.max(0, phaseEndsAt - tSim);
 
   return (
     <div className="rounded-lg border border-cyan-700/40 bg-cyan-950/10 p-3 flex flex-wrap items-center gap-3">
@@ -60,22 +72,15 @@ export function StrainBar({ ev }: { ev: TelemetryEvent | null }) {
       </button>
 
       {admixActive && (
-        <div className="w-full mt-1 rounded border border-fuchsia-500/40 bg-fuchsia-950/30 px-3 py-2 text-xs text-fuchsia-100 leading-relaxed">
-          <div className="flex items-center gap-2 font-semibold">
-            <span className="inline-block w-2 h-2 rounded-full bg-fuchsia-400 animate-pulse" />
-            杂交期进行中（admixture window）
-            <span className="font-mono numeric text-fuchsia-200/80 ml-2">
-              剩 {remain.toFixed(1)}s / 共 {windowS.toFixed(1)}s
-            </span>
-          </div>
-          <div className="mt-1 font-mono numeric text-fuchsia-200/80 text-[11px]">
-            eff_hgt_prob = {(ev?.eff_hgt_prob ?? 0).toFixed(4)}{" "}
-            (基线 ×{ev?.admixture_hgt_multiplier?.toFixed(1) ?? "?"})
-          </div>
-          <div className="mt-1 text-[11px] text-fuchsia-200/70">
-            两个菌株正在大幅交换基因 — 双修个体最容易在这个窗口里诞生。
-          </div>
-        </div>
+        <PhaseBadge
+          phase={admixPhase}
+          remain={remain}
+          phaseTotal={phaseTotal}
+          phase2Blend={phase2Blend}
+          phase2Mul={phase2Mul}
+          effHgtBlend={effHgtBlend}
+          effHgtProb={effHgtProb}
+        />
       )}
 
       {saveOpen && (
@@ -86,6 +91,74 @@ export function StrainBar({ ev }: { ev: TelemetryEvent | null }) {
       )}
     </div>
   );
+}
+
+/**
+ * SPEC_L2_V3.4 — phase-aware "杂交进行中" badge.
+ *
+ * Rendered only while the admixture protocol is active (phase 1 or 2).
+ *   Phase 1 (commensal): cyan, "HGT 完全关闭" — observers should expect zero
+ *     transfers; the two strains are getting their footing independently.
+ *   Phase 2 (controlled exchange): fuchsia/pulsing, shows current eff_blend +
+ *     eff_prob — observers should see HGT events fire but at low intensity.
+ */
+function PhaseBadge({
+  phase,
+  remain,
+  phaseTotal,
+  phase2Blend,
+  phase2Mul,
+  effHgtBlend,
+  effHgtProb,
+}: {
+  phase: 1 | 2 | 3;
+  remain: number;
+  phaseTotal: number;
+  phase2Blend: number;
+  phase2Mul: number;
+  effHgtBlend: number;
+  effHgtProb: number;
+}) {
+  if (phase === 1) {
+    return (
+      <div className="w-full mt-1 rounded border border-cyan-500/40 bg-cyan-950/30 px-3 py-2 text-xs text-cyan-100 leading-relaxed">
+        <div className="flex items-center gap-2 font-semibold">
+          <span className="inline-block w-2 h-2 rounded-full bg-cyan-300" />
+          ① 共栖期 (commensal · HGT off)
+          <span className="font-mono numeric text-cyan-200/80 ml-2">
+            剩 {remain.toFixed(1)}s / 共 {phaseTotal.toFixed(1)}s
+          </span>
+        </div>
+        <div className="mt-1 font-mono numeric text-cyan-200/70 text-[11px]">
+          eff_hgt_prob = 0 · eff_blend = 0 · 两群菌株共享培养皿但基因池隔离
+        </div>
+        <div className="mt-1 text-[11px] text-cyan-200/60">
+          先让每个菌株各自在新环境里站稳脚跟；交换期开始前不会有任何基因转移。
+        </div>
+      </div>
+    );
+  }
+  if (phase === 2) {
+    return (
+      <div className="w-full mt-1 rounded border border-fuchsia-500/40 bg-fuchsia-950/30 px-3 py-2 text-xs text-fuchsia-100 leading-relaxed">
+        <div className="flex items-center gap-2 font-semibold">
+          <span className="inline-block w-2 h-2 rounded-full bg-fuchsia-400 animate-pulse" />
+          ② 受控交换期 (controlled exchange · low blend)
+          <span className="font-mono numeric text-fuchsia-200/80 ml-2">
+            剩 {remain.toFixed(1)}s / 共 {phaseTotal.toFixed(1)}s
+          </span>
+        </div>
+        <div className="mt-1 font-mono numeric text-fuchsia-200/80 text-[11px]">
+          eff_blend = {effHgtBlend.toFixed(3)} (cfg {phase2Blend.toFixed(2)}) ·
+          eff_hgt_prob = {effHgtProb.toFixed(4)} (× {phase2Mul.toFixed(1)})
+        </div>
+        <div className="mt-1 text-[11px] text-fuchsia-200/70">
+          基因开始小步渗透——双修个体在这段时间里诞生而不会被大幅值的一方瞬间扫荡。
+        </div>
+      </div>
+    );
+  }
+  return null;
 }
 
 function SaveStrainModal({

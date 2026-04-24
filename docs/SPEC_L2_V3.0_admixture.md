@@ -206,3 +206,93 @@ L2v2（SPEC_L2_V2.0）已经稳定跑通 AND（acc_AND ≈ 92%），但 NOT 长�
 杂交皿不是为了「让 NOT 一定能涌现」。它是把演化失败的责任从「演化算法不行」推回到「环境布置不到位」—— **用户决定开几个独立培养皿、按什么比例混合、给多长杂交期**，这些决策本身就是演化实验的一部分。
 
 如果用户选错（比如两个都是 AND 菌株），他会得到一个还是只会 AND 的种群 —— 算法没错，环境没设好。这正是 Lenski 实验的精神：**实验生物学家的工作是设计实验，不是干预演化**。
+
+---
+
+## 7. ERRATA — v3.4：3 相生态杂交协议（2026-04-22）
+
+### 7.1 v3.0 单窗口模型的失败
+
+按 v3.0 §1.4 的设计，杂交期 = 启动后 N 秒内 `eff_hgt_prob = base × multiplier`。
+实测一旦把 D1 NOT 学家（structural seed，权重幅值 ±2~±5）和 AND 学家
+（自然演化出来，权重幅值通常 ±0.5~±2）倒进同一培养皿，会出现「单边
+污染」：
+
+- HGT 用 `blend_weights(w_recipient, w_donor, η=0.30)` 做凸组合
+- NOT 学家是 donor 时，强幅值的负权重一次就把 AND 学家的对应正权重
+  「翻号」——AND 逻辑当场失效
+- 反过来 AND 学家做 donor 时，弱幅值对 NOT 学家的强结构种子几乎没影响
+- 加上 admixture 期 HGT × 5 的爆发，几十秒内整群被 NOT 表型扫荡，
+  `acc_and_11_pop` 从 0.85 跌到 0.27（实测截图，2026-04-22）
+
+根本原因是 v3.0 的「立即放大基因流」与生物学相反：真实的双菌共栖
+（Lenski LTEE、Synechococcus / Prochlorococcus 海洋混合）总是先有
+**长时间共栖期**，让两群各自适应新环境，然后才会出现可观测的 HGT；
+HGT 一旦发生，**单次转移的基因量很小**（几个 ORF / 一段质粒），
+不会一次替换掉半个基因组。
+
+### 7.2 v3.4 协议：3 相
+
+把 `admixture_window_s` + `admixture_hgt_multiplier` 两个旧参数替换成
+4 个新参数：
+
+| 参数 | 默认 | 含义 |
+|---|---|---|
+| `admixture_commensal_s` | `60.0` | Phase 1（共栖期）长度，HGT 完全关闭 |
+| `admixture_exchange_s` | `120.0` | Phase 2（受控交换期）长度 |
+| `admixture_phase2_blend` | `0.05` | Phase 2 期间的 `hgt_blend`（基线 0.30） |
+| `admixture_phase2_prob_mul` | `1.0` | Phase 2 期间的 `hgt_prob` 倍率 |
+
+阶段判别由 `Population._admixture_phase()` 实现：
+
+```
+t < commensal_s                           → Phase 1（HGT 全关）
+commensal_s ≤ t < commensal_s + exchange_s → Phase 2（低 blend HGT）
+t ≥ commensal_s + exchange_s              → Phase 3（基线 HGT）
+commensal_s == 0 且 exchange_s == 0       → Phase 3（协议禁用）
+```
+
+- **Phase 1（共栖期）**：HGT 完全关闭。两个 founder 群体共享同一物理
+  培养皿（slime grid）、共享代谢经济（食物 / 信息素），但基因池**完全
+  隔离**。每个菌株各自在新环境里完成 founder collapse 抗性测试，
+  确认能在新难度预设下存活。
+- **Phase 2（受控交换期）**：HGT 启用，但 `hgt_blend` 降到 0.05（基线的
+  1/6）。每次转移只渗透几条权重，不会一口替换掉对方半个基因组。即使
+  D1 种子的强负权重被转移给 AND 学家，η=0.05 意味着 AND 学家的正权重
+  只被拉低 5%，不会翻号。给演化足够多的尝试次数找到「真正有用的
+  crossover」（保留两边表型的杂交个体）。
+- **Phase 3（恢复期）**：协议结束，HGT 回到 colony 基线。从这里开始
+  就是普通 colony，已经长出来的双修个体凭借代谢竞争力继续传播。
+
+### 7.3 Telemetry 变化
+
+`step_window` 返回的 info 字典新增：
+
+```python
+"admixture_phase":          1 | 2 | 3,
+"admixture_active":         bool,        # phase ∈ {1, 2}
+"admixture_commensal_s":    float,
+"admixture_exchange_s":     float,
+"admixture_phase2_blend":   float,
+"admixture_phase2_prob_mul":float,
+"eff_hgt_prob":             float,       # 当前 phase 实际生效
+"eff_hgt_blend":            float,       # 当前 phase 实际生效
+```
+
+UI（StrainBar）按 phase 渲染不同徽章：青色 = ① 共栖期、洋红 + 脉动 = 
+② 受控交换期、Phase 3 不显示徽章（已是普通 colony）。
+
+### 7.4 向后兼容
+
+旧字段 `admixture_window_s` / `admixture_hgt_multiplier` **完全移除**。
+保存的 strain 文件不受影响（meta 里没有 admixture 字段）；只有 UI 表单
+和 `POST /api/start` 的 body schema 变了。
+
+### 7.5 没做（暂列）
+
+- 把 HGT 的 `blend_weights`（凸组合）改成「per-cell crossover」（每条
+  权重独立从 donor 或 recipient 二选一抽样）。这是更接近真实细菌
+  接合 / 转化的 B 方案。如果 v3.4 的 phase 2 仍然出现单边污染再考虑。
+- 三个或更多菌株的协议化杂交：当前协议对所有 founder 一视同仁，没有
+  「strain A 先和 B 共栖、再和 C 杂交」的高阶序列。
+
